@@ -29,6 +29,7 @@ Key behavioral notes (informational only):
 
 import os
 import sys
+import signal
 import time
 import shutil
 import datetime
@@ -76,9 +77,20 @@ def _is_debug_mode() -> bool:
 		return _debug_mode_cache["enabled"]
 
 def debug_print(msg: str):
-	"""Print debug message only if debug mode is enabled"""
+	"""Print debug message only if debug mode is enabled, also log to file"""
 	if _is_debug_mode():
 		print(msg)
+		# Also write to debug log file
+		try:
+			# Get coin name from command line args if available
+			coin_name = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+			log_file = f"debug_trainer_{coin_name}.log"
+			import datetime
+			timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+			with open(log_file, "a", encoding="utf-8") as f:
+				f.write(f"[{timestamp}] {msg}\n")
+		except Exception:
+			pass  # Don't let logging errors break the trainer
 
 def handle_network_error(operation: str, error: Exception):
 	"""Print network error and suggest enabling debug mode"""
@@ -94,16 +106,9 @@ def handle_network_error(operation: str, error: Exception):
 	mark_training_error(f"Network error: {operation}")
 	sys.exit(1)
 
-"""
-<------------
-newest oldest
------------->
-oldest newest
-"""
 avg50 = []
 sells_count = 0
 prediction_prices_avg_list = []
-pt_server = 'server'
 list_len = 0
 restarting = 'no'
 in_trade = 'no'
@@ -317,7 +322,18 @@ def PrintException():
 	filename = f.f_code.co_filename
 	linecache.checkcache(filename)
 	line = linecache.getline(filename, lineno, f.f_globals)
-	print ('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
+	msg = 'EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj)
+	print(msg)
+	# Always log exceptions to file (even without debug mode)
+	try:
+		coin_name = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+		log_file = f"debug_trainer_{coin_name}.log"
+		import datetime
+		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		with open(log_file, "a", encoding="utf-8") as f:
+			f.write(f"[{timestamp}] {msg}\n")
+	except Exception:
+		pass
 how_far_to_look_back = 100000
 number_of_candles = [2]
 number_of_candles_index = 0
@@ -446,6 +462,28 @@ except Exception:
 	_arg_coin = "BTC"
 
 coin_choice = _arg_coin + '-USDT'
+
+# Signal handler to update status on forced exit (Ctrl+C, kill, etc.)
+def _signal_handler(signum, frame):
+	try:
+		with open("trainer_status.json", "w", encoding="utf-8") as f:
+			json.dump(
+				{
+					"coin": _arg_coin,
+					"state": "STOPPED",
+					"stopped_at": int(time.time()),
+					"message": "Training interrupted",
+					"timestamp": int(time.time()),
+				},
+				f,
+			)
+	except Exception:
+		pass
+	sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _signal_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, _signal_handler)  # kill command
 
 restart_processing = "yes"
 
@@ -617,11 +655,26 @@ while True:
 		time.sleep(.5)
 		try:
 			debug_print(f"[DEBUG] TRAINER: Fetching historical data from KuCoin...")
-			history = str(market.get_kline(coin_choice,timeframe,startAt=end_time,endAt=start_time)).replace(']]','], ').replace('[[','[').split('], [')
+			kline_data = market.get_kline(coin_choice,timeframe,startAt=end_time,endAt=start_time)
+			
+			# Validate response format
+			if kline_data:
+				# Check if response is wrapped in {code: ..., data: [...]} format
+				if isinstance(kline_data, dict) and 'data' in kline_data:
+					print(f"Timeframe {timeframe}: Unwrapping KuCoin response wrapper")
+					kline_data = kline_data['data']
+				
+				# Validate first entry has minimum required fields
+				if kline_data and len(kline_data) > 0:
+					first_entry = kline_data[0]
+					if not isinstance(first_entry, (list, tuple)) or len(first_entry) < 5:
+						raise ValueError(f"Invalid candle format: expected at least 5 fields, got {len(first_entry) if isinstance(first_entry, (list, tuple)) else 'non-list'}")
+			
+			history = str(kline_data).replace(']]','], ').replace('[[','[').split('], [')
 			kucoin_retry_count = 0  # Reset on success
 		except Exception as e:
 			kucoin_retry_count += 1
-			debug_print(f"[DEBUG] TRAINER: KuCoin error (attempt {kucoin_retry_count}/{kucoin_max_retries})")
+			debug_print(f"[DEBUG] TRAINER: KuCoin error (attempt {kucoin_retry_count}/{kucoin_max_retries}): {e}")
 			if kucoin_retry_count >= kucoin_max_retries:
 				handle_network_error(f"KuCoin historical data fetch for {_arg_coin}", e)
 			PrintException()
@@ -639,7 +692,6 @@ while True:
 		print('gathering history')
 		current_change = len(history_list)-list_len
 		try:
-			print('\n' + str(current_change))
 			if current_change < 1000:
 				break
 			else:
@@ -652,9 +704,10 @@ while True:
 		last_perc_comp = perc_comp
 		start_time = end_time
 		end_time = int(start_time-((1500*timeframe_minutes)*60))
-		print(last_start_time)
-		print(start_time)
-		print(end_time)
+		print(f'Batch size: {current_change}')
+		print(f'Last training start: {last_start_time}')
+		print(f'Batch end timestamp: {start_time}')
+		print(f'Batch start timestamp: {end_time}')
 		if start_time <= last_start_time:
 			break
 		else:
@@ -865,13 +918,13 @@ while True:
 				print(f'Training for {_arg_coin} stopped cleanly. Progress saved.')
 				sys.exit(0)
 			else:
-				exited = 'no'
+				pass
 			perfect = []
 			while True:
 				try:
-					print(f'{choice_index}')
-					print(restarted_yet)
-					print(tf_list[restarted_yet])
+					print(f'Coin index: {choice_index}')
+					print(f'Training cycle: {restarted_yet}')
+					print(f'Timeframe: {tf_list[restarted_yet]}')
 					try:
 						current_pattern_length = number_of_candles[number_of_candles_index]
 						index = (len(price_change_list))-(number_of_candles[number_of_candles_index]-1)
@@ -936,8 +989,33 @@ while True:
 							high_moves = []
 							low_moves = []
 							while True:
+								# Check if we've exhausted all memories or if memory_list is empty
+								if memory_index >= len(memory_list):
+									if len(memory_list) == 0:
+										debug_print(f"[DEBUG] TRAINER: memory_list is empty, will create first memory")
+									if any_perfect == 'no':
+										if len(diffs_list) > 0:
+											memory_diff = min(diffs_list)
+											which_memory_index = diffs_list.index(memory_diff)
+										perfect.append('no')
+										final_moves = 0.0
+										high_final_moves = 0.0
+										low_final_moves = 0.0
+										new_memory = 'yes'
+									else:
+										try:
+											final_moves = sum(moves)/len(moves)
+											high_final_moves = sum(high_moves)/len(high_moves)
+											low_final_moves = sum(low_moves)/len(low_moves)
+										except:
+											final_moves = 0.0
+											high_final_moves = 0.0
+											low_final_moves = 0.0
+										which_memory_index = perfect_dexs[perfect_diffs.index(min(perfect_diffs))]
+										perfect.append('yes')
+									break
+								
 								memory_pattern = memory_list[memory_index].split('{}')[0].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
-								avgs = []
 								checks = []
 								check_dex = 0
 								while True:
@@ -1111,8 +1189,6 @@ while True:
 						high_all_predictions.append(high_prediction_prices)
 						low_all_predictions.append(low_prediction_prices)
 						index = 0
-						print(tf_choice)
-						page_info = ''
 						current_pattern_length = 3
 						index = (len(price_list2)-1)-current_pattern_length
 						current_pattern = []
@@ -1242,8 +1318,6 @@ while True:
 										break
 									else:
 										continue
-							high_var = high_percent_difference_of_last
-							low_var = low_percent_difference_of_last
 							if last_flipped == 'no':
 								if high_percent_difference_of_actuals >= high_baseline_price_change_pct+(high_baseline_price_change_pct*0.005) and percent_difference_of_actuals < high_baseline_price_change_pct:
 									upordown3.append(1)
@@ -1284,7 +1358,9 @@ while True:
 							else:
 								pass
 							try:
-								print('(Bounce Accuracy for last 100 Over Limit Candles): ' + format((sum(upordown4)/len(upordown4))*100,'.2f'))
+								accuracy = (sum(upordown4)/len(upordown4))*100
+								formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
+								print(f'Bounce Accuracy for last 100 Over Limit Candles: {formatted}%')
 							except:
 								pass
 							try:
@@ -1299,7 +1375,6 @@ while True:
 							PrintException()
 					else:
 						pass
-					cc_on = 'no'
 					try:
 						long_trade = 'no'
 						short_trade = 'no'
@@ -1373,7 +1448,6 @@ while True:
 										avg50 = []
 										sells_count = 0
 										prediction_prices_avg_list = []
-										pt_server = 'server'
 										list_len = 0
 										in_trade = 'no'
 										updowncount = 0
@@ -1454,8 +1528,8 @@ while True:
 										upordown5 = []
 										how_far_to_look_back = 100000
 										list_len = 0
-										print(the_big_index)
-										print(len(tf_choices))
+										print(f'Timeframe index: {the_big_index}')
+										print(f'Total timeframes: {len(tf_choices)}')
 										if the_big_index >= len(tf_choices):
 											if len(number_of_candles) == 1:
 												print("Finished processing all timeframes (number_of_candles has only one entry). Exiting.")
@@ -1498,7 +1572,6 @@ while True:
 											pass
 										break
 									else:
-										exited = 'no'
 										try:
 											price_list2 = []
 											price_list_index = 0
@@ -1554,114 +1627,115 @@ while True:
 												except:
 													difference = 100.0
 												try:
-													direction = 'down'
 													try:
 														indy = 0
 														# Ensure all lists have data before attempting weight updates
 														if len(moves) == 0 or len(high_moves) == 0 or len(low_moves) == 0:
-															raise Exception("No moves data available for weight update")
-														
-														# Find the minimum length across all lists to avoid index errors
-														# Process as much valid data as possible even if lists got out of sync
-														max_safe_index = min(
-															len(moves), len(high_moves), len(low_moves),
-															len(move_weights), len(high_move_weights), len(low_move_weights),
-															len(perfect_dexs), len(unweighted)
-														)
-														
-														while True:
-															# Safety check: stop when we reach the shortest list
-															if indy >= max_safe_index:
-																break
+															debug_print(f"[DEBUG] TRAINER: No matching patterns for weight update - creating new memory")
 															
-															new_memory = 'no'
-															predicted_move_pct = (moves[indy]*100)
-															high_predicted_move_pct = (high_moves[indy]*100)
-															low_predicted_move_pct = (low_moves[indy]*100)
+															# Create new memory when no patterns match
+															all_current_patterns[highlowind].append(this_diff)
 															
-															# Safe threshold calculation - prevent division/comparison issues with zero values
-															# When predicted_move_pct=0 (flat price), use small absolute threshold instead
-															predicted_move_pct_threshold = abs(predicted_move_pct) * 0.1 if predicted_move_pct != 0 else 0.1
-															high_predicted_move_pct_threshold = abs(high_predicted_move_pct) * 0.1 if high_predicted_move_pct != 0 else 0.1
-															low_predicted_move_pct_threshold = abs(low_predicted_move_pct) * 0.1 if low_predicted_move_pct != 0 else 0.1
+															mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
 															
-															debug_print(f"[DEBUG] TRAINER: Weight update - predicted_move_pct={predicted_move_pct:.4f}, threshold={predicted_move_pct_threshold:.4f}")
-															
-															if high_perc_diff_now_actual > high_predicted_move_pct + high_predicted_move_pct_threshold:
-																high_new_weight = high_move_weights[indy] + 0.25
-																if high_new_weight > 2.0:
-																	high_new_weight = 2.0
-																else:
-																	pass
-															elif high_perc_diff_now_actual < high_predicted_move_pct - high_predicted_move_pct_threshold:
-																high_new_weight = high_move_weights[indy] - 0.25
-																if high_new_weight < 0.0:
-																	high_new_weight = 0.0
-																else:
-																	pass
-															else:
-																high_new_weight = high_move_weights[indy]
-															if low_perc_diff_now_actual < low_predicted_move_pct - low_predicted_move_pct_threshold:
-																low_new_weight = low_move_weights[indy] + 0.25
-																if low_new_weight > 2.0:
-																	low_new_weight = 2.0
-																else:
-																	pass
-															elif low_perc_diff_now_actual > low_predicted_move_pct + low_predicted_move_pct_threshold:
-																low_new_weight = low_move_weights[indy] - 0.25
-																if low_new_weight < 0.0:
-																	low_new_weight = 0.0
-																else:
-																	pass
-															else:
-																low_new_weight = low_move_weights[indy]
-															if perc_diff_now_actual > predicted_move_pct + predicted_move_pct_threshold:
-																new_weight = move_weights[indy] + 0.25
-																if new_weight > 2.0:
-																	new_weight = 2.0
-																else:
-																	pass
-															elif perc_diff_now_actual < predicted_move_pct - predicted_move_pct_threshold:
-																new_weight = move_weights[indy] - 0.25
-																if new_weight < (0.0-2.0):
-																	new_weight = (0.0-2.0)
-																else:
-																	pass
-															else:
-																new_weight = move_weights[indy]
-															
-															# Update cache directly (local lists are references to cached lists)
-															weight_list[perfect_dexs[indy]] = new_weight
-															high_weight_list[perfect_dexs[indy]] = high_new_weight
-															low_weight_list[perfect_dexs[indy]] = low_new_weight
-
-															# mark dirty (we will flush in batches)
-															# Note: _mem already loaded at top of outer training loop, no need to reload
+															_mem["memory_list"].append(mem_entry)
+															_mem["weight_list"].append('1.0')
+															_mem["high_weight_list"].append('1.0')
+															_mem["low_weight_list"].append('1.0')
 															_mem["dirty"] = True
-
+															
 															# occasional batch flush
 															if loop_i % 200 == 0:
 																flush_memory(tf_choice)
+														else:
+															# Find the minimum length across all lists to avoid index errors
+															# Process as much valid data as possible even if lists got out of sync
+															max_safe_index = min(
+																len(moves), len(high_moves), len(low_moves),
+																len(move_weights), len(high_move_weights), len(low_move_weights),
+																len(perfect_dexs), len(unweighted)
+															)
+															
+															while True:
+																# Safety check: stop when we reach the shortest list
+																if indy >= max_safe_index:
+																	break
+																
+																new_memory = 'no'
+																predicted_move_pct = (moves[indy]*100)
+																high_predicted_move_pct = (high_moves[indy]*100)
+																low_predicted_move_pct = (low_moves[indy]*100)
+																
+																# Safe threshold calculation - prevent division/comparison issues with zero values
+																# When predicted_move_pct=0 (flat price), use small absolute threshold instead
+																predicted_move_pct_threshold = abs(predicted_move_pct) * 0.1 if predicted_move_pct != 0 else 0.1
+																high_predicted_move_pct_threshold = abs(high_predicted_move_pct) * 0.1 if high_predicted_move_pct != 0 else 0.1
+																low_predicted_move_pct_threshold = abs(low_predicted_move_pct) * 0.1 if low_predicted_move_pct != 0 else 0.1
+																
+																debug_print(f"[DEBUG] TRAINER: Weight update - predicted_move_pct={predicted_move_pct:.4f}, threshold={predicted_move_pct_threshold:.4f}")
+																
+																if high_perc_diff_now_actual > high_predicted_move_pct + high_predicted_move_pct_threshold:
+																	high_new_weight = high_move_weights[indy] + 0.25
+																	if high_new_weight > 2.0:
+																		high_new_weight = 2.0
+																	else:
+																		pass
+																elif high_perc_diff_now_actual < high_predicted_move_pct - high_predicted_move_pct_threshold:
+																	high_new_weight = high_move_weights[indy] - 0.25
+																	if high_new_weight < 0.0:
+																		high_new_weight = 0.0
+																	else:
+																		pass
+																else:
+																	high_new_weight = high_move_weights[indy]
+																if low_perc_diff_now_actual < low_predicted_move_pct - low_predicted_move_pct_threshold:
+																	low_new_weight = low_move_weights[indy] + 0.25
+																	if low_new_weight > 2.0:
+																		low_new_weight = 2.0
+																	else:
+																		pass
+																elif low_perc_diff_now_actual > low_predicted_move_pct + low_predicted_move_pct_threshold:
+																	low_new_weight = low_move_weights[indy] - 0.25
+																	if low_new_weight < 0.0:
+																		low_new_weight = 0.0
+																	else:
+																		pass
+																else:
+																	low_new_weight = low_move_weights[indy]
+																if perc_diff_now_actual > predicted_move_pct + predicted_move_pct_threshold:
+																	new_weight = move_weights[indy] + 0.25
+																	if new_weight > 2.0:
+																		new_weight = 2.0
+																	else:
+																		pass
+																elif perc_diff_now_actual < predicted_move_pct - predicted_move_pct_threshold:
+																	new_weight = move_weights[indy] - 0.25
+																	if new_weight < (0.0-2.0):
+																		new_weight = (0.0-2.0)
+																	else:
+																		pass
+																else:
+																	new_weight = move_weights[indy]
+																
+																# Update cache directly (local lists are references to cached lists)
+																weight_list[perfect_dexs[indy]] = new_weight
+																high_weight_list[perfect_dexs[indy]] = high_new_weight
+																low_weight_list[perfect_dexs[indy]] = low_new_weight
 
-															indy += 1
-															# Loop condition moved to top of while loop for safety
+																# mark dirty (we will flush in batches)
+																# Note: _mem already loaded at top of outer training loop, no need to reload
+																_mem["dirty"] = True
+
+																# occasional batch flush
+																if loop_i % 200 == 0:
+																	flush_memory(tf_choice)
+
+																indy += 1
+																# Loop condition moved to top of while loop for safety
 													except:
+														# Catch unexpected errors during weight updates
 														PrintException()
-														all_current_patterns[highlowind].append(this_diff)
-
-														# build the same memory entry format, but store in RAM
-														mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
-
-														# Note: _mem already loaded at top of outer training loop, no need to reload
-														_mem["memory_list"].append(mem_entry)
-														_mem["weight_list"].append('1.0')
-														_mem["high_weight_list"].append('1.0')
-														_mem["low_weight_list"].append('1.0')
-														_mem["dirty"] = True
-
-														# occasional batch flush
-														if loop_i % 200 == 0:
-															flush_memory(tf_choice)
+														pass
 
 												except:
 													PrintException()

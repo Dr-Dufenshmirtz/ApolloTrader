@@ -209,7 +209,16 @@ def PrintException():
 
 	linecache.checkcache(filename)
 	line = linecache.getline(filename, lineno, f.f_globals)
-	print('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
+	msg = 'EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj)
+	print(msg)
+	# Always log exceptions to file (even without debug mode)
+	try:
+		import datetime
+		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		with open("debug_thinker.log", "a", encoding="utf-8") as f:
+			f.write(f"[{timestamp}] {msg}\n")
+	except Exception:
+		pass
 
 restarted = 'no'
 short_started = 'no'
@@ -245,9 +254,17 @@ def _is_debug_mode() -> bool:
 		return _gui_settings_cache["debug_mode"]
 
 def debug_print(msg: str):
-	"""Print debug message only if debug mode is enabled"""
+	"""Print debug message only if debug mode is enabled, also log to file"""
 	if _is_debug_mode():
 		print(msg)
+		# Also write to debug log file
+		try:
+			import datetime
+			timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+			with open("debug_thinker.log", "a", encoding="utf-8") as f:
+				f.write(f"[{timestamp}] {msg}\n")
+		except Exception:
+			pass  # Don't let logging errors break the thinker
 
 def _get_sleep_timing(key: str) -> float:
 	"""Get sleep timing from gui_settings.json with fallback to cache defaults"""

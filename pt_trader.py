@@ -102,9 +102,17 @@ _circuit_breaker = {
 }
 
 def debug_print(msg: str):
-	"""Print debug message only if debug mode is enabled"""
+	"""Print debug message only if debug mode is enabled, also log to file"""
 	if _is_debug_mode():
 		print(msg)
+		# Also write to debug log file
+		try:
+			import datetime
+			timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+			with open("debug_trader.log", "a", encoding="utf-8") as f:
+				f.write(f"[{timestamp}] {msg}\n")
+		except Exception:
+			pass  # Don't let logging errors break the trader
 
 def sim_prefix() -> str:
 	"""Return [SIM] prefix if simulation mode is enabled"""
@@ -863,8 +871,17 @@ class CryptoAPITrading:
                         processed_dca_buys += 1
 
         except Exception as e:
-            print(f"WARNING: Error reading trade history file: {e}")
+            msg = f"WARNING: Error reading trade history file: {e}"
+            print(msg)
             debug_print(f"[DEBUG] TRADER: Trade history read error: {e}")
+            # Log to file
+            try:
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open("debug_trader.log", "a", encoding="utf-8") as f:
+                    f.write(f"[{timestamp}] {msg}\n")
+            except Exception:
+                pass
             return
 
         # Log validation summary
@@ -2104,7 +2121,16 @@ class CryptoAPITrading:
                 loop_delay = trading_cfg.get("timing", {}).get("main_loop_delay_seconds", 0.5)
                 time.sleep(loop_delay)
             except Exception as e:
-                print(traceback.format_exc())
+                msg = traceback.format_exc()
+                print(msg)
+                # Log to file
+                try:
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open("debug_trader.log", "a", encoding="utf-8") as f:
+                        f.write(f"[{timestamp}] MAIN LOOP EXCEPTION:\n{msg}\n")
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     trading_bot = CryptoAPITrading()

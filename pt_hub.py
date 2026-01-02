@@ -2232,8 +2232,8 @@ class PowerTraderHub(tk.Tk):
 
         # Prevent the outer (left/right) panes from being collapsible to 0 width
         try:
-            outer.paneconfigure(left, minsize=360)
-            outer.paneconfigure(right, minsize=520)
+            outer.paneconfig(left, minsize=360)
+            outer.paneconfig(right, minsize=520)
         except Exception:
             pass
 
@@ -2505,17 +2505,17 @@ class PowerTraderHub(tk.Tk):
         acct_box = ttk.LabelFrame(controls_left, text="Account")
         acct_box.pack(fill="x", padx=6, pady=6)
         
-        # Simulation mode banner (prominent warning)
+        # Simulation mode banner (prominent warning) - initially hidden
         self.lbl_simulation_banner = ttk.Label(
             acct_box, 
             text="", 
             foreground="#FF8C00",  # Dark orange
             font=("TkDefaultFont", 10, "bold")
         )
-        self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4))
+        # Don't pack initially - only show when simulation mode is active
 
         self.lbl_acct_total_value = ttk.Label(acct_box, text="Total Account Value: N/A")
-        self.lbl_acct_total_value.pack(anchor="w", padx=6, pady=(2, 0))
+        self.lbl_acct_total_value.pack(anchor="w", padx=6, pady=(4, 0))
 
         self.lbl_acct_holdings_value = ttk.Label(acct_box, text="Holdings Value: N/A")
         self.lbl_acct_holdings_value.pack(anchor="w", padx=6, pady=(2, 0))
@@ -2538,8 +2538,9 @@ class PowerTraderHub(tk.Tk):
 
         # Neural levels overview (spans FULL width under the dual section)
         # Shows the current LONG/SHORT level (0..7) for every coin at once.
+        # Only fills needed space (shrinks to one row if that's all that's needed)
         neural_box = ttk.LabelFrame(top_controls, text="Neural Levels (0–7)")
-        neural_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        neural_box.pack(fill="x", expand=False, padx=6, pady=(0, 6))
 
         legend = ttk.Frame(neural_box)
         legend.pack(fill="x", padx=6, pady=(4, 0))
@@ -2554,8 +2555,10 @@ class PowerTraderHub(tk.Tk):
         self.lbl_neural_overview_last.pack(side="right")
 
         # Scrollable area for tiles (auto-hides the scrollbar if everything fits)
-        neural_viewport = ttk.Frame(neural_box)
-        neural_viewport.pack(fill="both", expand=True, padx=6, pady=(4, 6))
+        # Height: 500px shows 2 rows with extra space for full tile visibility
+        neural_viewport = ttk.Frame(neural_box, height=500)
+        neural_viewport.pack(fill="x", expand=False, padx=6, pady=(4, 6))
+        neural_viewport.pack_propagate(False)  # Fixed height, content scrolls if needed
         neural_viewport.grid_rowconfigure(0, weight=1)
         neural_viewport.grid_columnconfigure(0, weight=1)
 
@@ -2766,14 +2769,14 @@ class PowerTraderHub(tk.Tk):
         self.logs_nb.bind("<<NotebookTabChanged>>", on_tab_selected)
 
         # Add left panes (no trades/history on the left anymore)
-        # Default should match the screenshot: more room for Controls/Health + Neural Levels.
-        left_split.add(top_controls, weight=1)
-        left_split.add(logs_frame, weight=1)
+        # Neural Levels shrinks to content, Live Output expands to fill remaining space.
+        left_split.add(top_controls, weight=0)  # Don't expand, just hold content
+        left_split.add(logs_frame, weight=1)     # Take all remaining space
 
         try:
-            # Ensure the top pane can't start (or be clamped) too small to show Neural Levels.
-            left_split.paneconfigure(top_controls, minsize=360)
-            left_split.paneconfigure(logs_frame, minsize=220)
+            # Neural Levels minsize ensures tiles are visible
+            left_split.paneconfig(top_controls, minsize=400)
+            left_split.paneconfig(logs_frame, minsize=220)
         except Exception:
             pass
 
@@ -2792,12 +2795,12 @@ class PowerTraderHub(tk.Tk):
                     self.after(10, _init_left_split_sash_once)
                     return
 
-                min_top = 360
+                min_top = 400  # Match minsize
                 min_bottom = 220
 
-                # Match screenshot feel: keep Live Output ~260px high, give the rest to top.
-                desired_bottom = 260
-                target = total - max(min_bottom, desired_bottom)
+                # Neural Levels will shrink to content, give Live Output most of the space.
+                # Start with sash at ~480px from top (room for controls + 2 rows of neural tiles)
+                target = 480
                 target = max(min_top, min(total - min_bottom, target))
 
                 left_split.sashpos(0, int(target))
@@ -3078,14 +3081,14 @@ class PowerTraderHub(tk.Tk):
 
         try:
             # Screenshot-style sizing: don't force Charts to be enormous by default.
-            right_split.paneconfigure(charts_frame, minsize=360)
-            right_split.paneconfigure(right_bottom_split, minsize=220)
+            right_split.paneconfig(charts_frame, minsize=360)
+            right_split.paneconfig(right_bottom_split, minsize=220)
         except Exception:
             pass
 
         try:
-            right_bottom_split.paneconfigure(trades_frame, minsize=140)
-            right_bottom_split.paneconfigure(hist_frame, minsize=120)
+            right_bottom_split.paneconfig(trades_frame, minsize=140)
+            right_bottom_split.paneconfig(hist_frame, minsize=120)
         except Exception:
             pass
 
@@ -3190,7 +3193,7 @@ class PowerTraderHub(tk.Tk):
         Enforces each pane's configured 'minsize' by clamping sash positions.
 
         NOTE:
-        ttk.Panedwindow.paneconfigure(pane) typically returns dict values like:
+        ttk.Panedwindow.paneconfig(pane) typically returns dict values like:
             {"minsize": ("minsize", "minsize", "Minsize", "140"), ...}
         so we MUST pull the last element when it's a tuple/list.
         """
@@ -3209,7 +3212,7 @@ class PowerTraderHub(tk.Tk):
 
             def _get_minsize(pane_id) -> int:
                 try:
-                    cfg = pw.paneconfigure(pane_id)
+                    cfg = pw.paneconfig(pane_id)
                     ms = cfg.get("minsize", 0)
 
                     # ttk returns tuples like ('minsize','minsize','Minsize','140')
@@ -3218,6 +3221,9 @@ class PowerTraderHub(tk.Tk):
 
                     # sometimes it's already int/float-like, sometimes it's a string
                     return max(0, int(float(ms)))
+                except tk.TclError:
+                    # Silently ignore TclError during paneconfig (occurs during widget initialization)
+                    return 0
                 except (ValueError, TypeError, IndexError) as e:
                     # Debug: log minsize parsing errors
                     if self.settings.get("debug_mode", False):
@@ -3580,6 +3586,31 @@ class PowerTraderHub(tk.Tk):
                 st = _safe_read_json(status_path)
 
                 if isinstance(st, dict) and str(st.get("state", "")).upper() == "TRAINING":
+                    # Verify the process is actually running by checking for pt_trainer.py process
+                    try:
+                        found_process = False
+                        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                            try:
+                                cmdline = proc.info.get('cmdline') or []
+                                if any('pt_trainer.py' in str(arg) and coin in str(arg) for arg in cmdline):
+                                    found_process = True
+                                    break
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                continue
+                        
+                        # If no process found, mark as STOPPED
+                        if not found_process:
+                            try:
+                                st["state"] = "STOPPED"
+                                st["timestamp"] = int(time.time())
+                                with open(status_path, "w", encoding="utf-8") as f:
+                                    json.dump(st, f)
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
+                    
                     stamp_path = os.path.join(folder, "trainer_last_training_time.txt")
 
                     try:
@@ -4036,7 +4067,7 @@ class PowerTraderHub(tk.Tk):
             
             # Hide simulation banner when no data
             try:
-                self.lbl_simulation_banner.config(text="")
+                self.lbl_simulation_banner.pack_forget()
             except Exception:
                 pass
 
@@ -4067,13 +4098,15 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             self.lbl_last_status.config(text="Last status: (timestamp parse error)")
         
-        # Update simulation mode banner
+        # Update simulation mode banner - show/hide as needed
         try:
             sim_mode = data.get("simulation_mode", False)
             if sim_mode:
                 self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
+                if not self.lbl_simulation_banner.winfo_ismapped():
+                    self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4), before=self.lbl_acct_total_value)
             else:
-                self.lbl_simulation_banner.config(text="")
+                self.lbl_simulation_banner.pack_forget()
         except Exception:
             pass
 
