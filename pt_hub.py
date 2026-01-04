@@ -503,7 +503,16 @@ DEFAULT_TRADING_CONFIG = {
 # Default training config
 DEFAULT_TRAINING_CONFIG = {
     "staleness_days": 14,
-    "auto_train_when_stale": False
+    "auto_train_when_stale": False,
+    "timeframes": [
+        "1hour",
+        "2hour",
+        "4hour",
+        "8hour",
+        "12hour",
+        "1day",
+        "1week"
+    ]
 }
 
 # Cache for trading config
@@ -2547,18 +2556,18 @@ class PowerTraderHub(tk.Tk):
 
         ttk.Label(legend, text="Level bars: 0 = bottom, 7 = top").pack(side="left")
         ttk.Label(legend, text="   ").pack(side="left")
-        ttk.Label(legend, text="Blue = Long").pack(side="left")
+        ttk.Label(legend, text="L = Long").pack(side="left")
         ttk.Label(legend, text="  ").pack(side="left")
-        ttk.Label(legend, text="Orange = Short").pack(side="left")
+        ttk.Label(legend, text="S = Short").pack(side="left")
 
         self.lbl_neural_overview_last = ttk.Label(legend, text="Last: N/A")
         self.lbl_neural_overview_last.pack(side="right")
 
         # Scrollable area for tiles (auto-hides the scrollbar if everything fits)
-        # Height: 500px shows 2 rows with extra space for full tile visibility
-        neural_viewport = ttk.Frame(neural_box, height=500)
+        # Height: Shows 2 rows with extra space for full tile visibility
+        neural_viewport = ttk.Frame(neural_box, height=600)
         neural_viewport.pack(fill="x", expand=False, padx=6, pady=(4, 6))
-        neural_viewport.pack_propagate(False)  # Fixed height, content scrolls if needed
+        neural_viewport.pack_propagate(True)  # Fixed height, content scrolls if needed
         neural_viewport.grid_rowconfigure(0, weight=1)
         neural_viewport.grid_columnconfigure(0, weight=1)
 
@@ -5674,16 +5683,16 @@ class PowerTraderHub(tk.Tk):
         dca_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         dca_frame.columnconfigure(0, weight=0)
         dca_frame.columnconfigure(1, weight=1)
-        
+
         dca_levels = cfg.get("dca", {}).get("levels", [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0])
-        
+
         # Cap DCA levels displayed in UI to prevent layout issues with excessive levels
         MAX_DCA_LEVELS_UI = 20
         if len(dca_levels) > MAX_DCA_LEVELS_UI:
             if self.settings.get("debug_mode", False):
                 print(f"[HUB DEBUG] DCA levels truncated for UI display: {len(dca_levels)} -> {MAX_DCA_LEVELS_UI}")
             dca_levels = dca_levels[:MAX_DCA_LEVELS_UI]
-        
+
         dca_level_vars = []
         dca_r = 0
         for i, level in enumerate(dca_levels):
@@ -5697,6 +5706,26 @@ class PowerTraderHub(tk.Tk):
 
         window_hours_var = tk.StringVar(value=str(cfg.get("dca", {}).get("window_hours", 24)))
         add_row(dca_frame, dca_r, "Window (hours):", window_hours_var); dca_r += 1
+
+        # --- Reset to Defaults Button ---
+        def reset_trading_defaults():
+            from copy import deepcopy
+            defaults = deepcopy(DEFAULT_TRADING_CONFIG)
+            # DCA
+            dca = defaults.get("dca", {})
+            levels = dca.get("levels", [])
+            for i, var in enumerate(dca_level_vars):
+                if i < len(levels):
+                    var.set(str(levels[i]))
+                else:
+                    var.set("")
+            max_buys_var.set(str(dca.get("max_buys_per_window", 2)))
+            window_hours_var.set(str(dca.get("window_hours", 24)))
+            # Add similar resets for other trading config fields as needed
+            # ...existing code for other fields...
+
+        ttk.Button(frm, text="Reset to Defaults", command=reset_trading_defaults).grid(row=r, column=0, sticky="w", pady=(0, 10))
+        r += 1
 
         multiplier_var = tk.StringVar(value=str(cfg.get("dca", {}).get("position_multiplier", 2.0)))
         add_row(dca_frame, dca_r, "Position multiplier (x):", multiplier_var); dca_r += 1
@@ -5908,8 +5937,8 @@ class PowerTraderHub(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Training Settings")
-        win.geometry("550x300")
-        win.minsize(450, 280)
+        win.geometry("700x420")
+        win.minsize(600, 350)
         win.configure(bg=DARK_BG)
 
         # Main container with padding
@@ -5939,7 +5968,25 @@ class PowerTraderHub(tk.Tk):
         # Auto-train checkbox
         auto_train_var = tk.BooleanVar(value=bool(cfg.get("auto_train_when_stale", False)))
         chk = ttk.Checkbutton(settings_frame, text="Automatically retrain when stale", variable=auto_train_var)
-        chk.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        chk.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        # --- Timeframes editable box and allowed list ---
+        allowed_timeframes = [
+            "1min", "5min", "15min", "30min", "1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"
+        ]
+        ttk.Label(settings_frame, text="Neural Timeframes:").grid(row=3, column=0, sticky="nw", padx=(0, 10), pady=(0, 6))
+        tf_box = tk.Text(settings_frame, height=10, width=24, wrap="none")
+        # Fill with current config, one per line
+        tf_list = cfg.get("timeframes", allowed_timeframes)
+        tf_box.insert("1.0", "\n".join(tf_list))
+        tf_box.grid(row=3, column=0, sticky="nw", padx=(0, 10), pady=(0, 6))
+
+        # Allowed values list (right side)
+        allowed_frame = ttk.Frame(settings_frame)
+        allowed_frame.grid(row=3, column=1, sticky="nw", padx=(20, 0), pady=(0, 6))
+        ttk.Label(allowed_frame, text="Allowed Timeframes:", font=(None, 10, "bold")).pack(anchor="w")
+        for tf in allowed_timeframes:
+            ttk.Label(allowed_frame, text=tf, foreground="#6cf").pack(anchor="w")
 
         # Buttons at bottom
         btns = ttk.Frame(container)
@@ -5949,28 +5996,46 @@ class PowerTraderHub(tk.Tk):
         def save():
             try:
                 staleness = int(staleness_var.get())
-                
-                # Validation
                 if staleness < 1:
                     messagebox.showerror("Validation Error", "Staleness threshold must be at least 1 day")
                     return
-                
+                # Parse and validate timeframes
+                tf_raw = tf_box.get("1.0", tk.END).replace(",", "\n")
+                tf_lines = [x.strip() for x in tf_raw.splitlines() if x.strip()]
+                tf_valid = [x for x in tf_lines if x in allowed_timeframes]
+                tf_invalid = [x for x in tf_lines if x and x not in allowed_timeframes]
+                if not tf_valid:
+                    messagebox.showerror("Validation Error", "At least one valid timeframe is required.")
+                    return
+                if tf_invalid:
+                    messagebox.showerror("Validation Error", f"Invalid timeframes: {', '.join(tf_invalid)}\nAllowed: {', '.join(allowed_timeframes)}")
+                    return
                 new_cfg = {
                     "staleness_days": staleness,
-                    "auto_train_when_stale": bool(auto_train_var.get())
+                    "auto_train_when_stale": bool(auto_train_var.get()),
+                    "timeframes": tf_valid
                 }
-
                 _safe_write_json(config_path, new_cfg)
                 messagebox.showinfo("Saved", "Training settings saved.")
                 win.destroy()
-
             except ValueError as e:
                 messagebox.showerror("Invalid Input", f"Please enter a valid number for staleness days.\n\n{e}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save settings:\n{e}")
 
+
         ttk.Button(btns, text="Apply", command=save).pack(side="left")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=8)
+
+        def reset_to_defaults():
+            try:
+                _safe_write_json(config_path, DEFAULT_TRAINING_CONFIG)
+                messagebox.showinfo("Reset", "Training settings have been reset to defaults.")
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to reset settings:\n{e}")
+
+        ttk.Button(btns, text="Reset to Defaults", command=reset_to_defaults).pack(side="left", padx=8)
 
     def _open_trading_config(self) -> None:
         """Open trading_settings.json in default text editor. Creates with defaults if missing."""

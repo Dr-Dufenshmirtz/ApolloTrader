@@ -449,8 +449,35 @@ try:
 		pass
 except:
 	restarted_yet = 0
-tf_choices = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
-tf_minutes = [60, 120, 240, 480, 720, 1440, 10080]
+import_path = os.path.join(os.path.dirname(__file__), "training_settings.json")
+default_timeframes = [
+    "1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"
+]
+tf_minutes_map = {
+	'1min': 1,
+	'5min': 5,
+	'15min': 15,
+	'30min': 30,
+	'1hour': 60,
+	'2hour': 120,
+	'4hour': 240,
+	'8hour': 480,
+	'12hour': 720,
+	'1day': 1440,
+	'1week': 10080
+}
+if os.path.isfile(import_path):
+	try:
+		with open(import_path, "r", encoding="utf-8") as f:
+			training_settings = json.load(f)
+		tf_choices = training_settings.get("timeframes", default_timeframes)
+		if not isinstance(tf_choices, list) or not tf_choices:
+			tf_choices = default_timeframes
+	except Exception:
+		tf_choices = default_timeframes
+else:
+	tf_choices = default_timeframes
+tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
 # --- GUI HUB INPUT (NO PROMPTS) ---
 # Usage: python pt_trainer.py BTC [reprocess_yes|reprocess_no]
 _arg_coin = "BTC"
@@ -604,15 +631,15 @@ while True:
 	low_weight_list = _mem["low_weight_list"]
 	memory_list_empty = 'no' if len(memory_list) > 0 else 'yes'
 
-	tf_list = ['1hour',tf_choice,tf_choice]
+	tf_list = [tf_choice, tf_choice, tf_choice]
 	choice_index = tf_choices.index(tf_choice)
-	minutes_list = [60,tf_minutes[choice_index],tf_minutes[choice_index]]
-	if restarted_yet < 2:
-		timeframe = tf_list[restarted_yet]#droplet setting (create list for all timeframes)
-		timeframe_minutes = minutes_list[restarted_yet]#droplet setting (create list for all timeframe_minutes)
+	minutes_list = [tf_minutes[choice_index], tf_minutes[choice_index], tf_minutes[choice_index]]
+	if restarted_yet < 3:
+		timeframe = tf_list[restarted_yet]
+		timeframe_minutes = minutes_list[restarted_yet]
 	else:
-		timeframe = tf_list[2]#droplet setting (create list for all timeframes)
-		timeframe_minutes = minutes_list[2]#droplet setting (create list for all timeframe_minutes)
+		timeframe = tf_list[2]
+		timeframe_minutes = minutes_list[2]
 	start_time = int(time.time())
 	restarting = 'no'
 	success_rate = 85
@@ -689,7 +716,8 @@ while True:
 			else:
 				continue
 		perc_comp = format((len(history_list)/how_far_to_look_back)*100,'.2f')
-		print('gathering history')
+		print()
+		print('Gathering data...')
 		current_change = len(history_list)-list_len
 		try:
 			if current_change < 1000:
@@ -922,9 +950,9 @@ while True:
 			perfect = []
 			while True:
 				try:
-					print(f'Coin index: {choice_index}')
-					print(f'Training cycle: {restarted_yet}')
-					print(f'Timeframe: {tf_list[restarted_yet]}')
+					print()
+					print(f'Training cycle: {restarted_yet + 1}')
+					print(f'Timeframe: {timeframe}')
 					try:
 						current_pattern_length = number_of_candles[number_of_candles_index]
 						index = (len(price_change_list))-(number_of_candles[number_of_candles_index]-1)
@@ -1021,13 +1049,13 @@ while True:
 								while True:
 									current_candle = float(current_pattern[check_dex])
 									memory_candle = float(memory_pattern[check_dex])
-									if current_candle + memory_candle == 0.0:
+									# Calculate difference with explicit zero-division protection
+									avg_value = (current_candle + memory_candle) / 2
+									if avg_value == 0.0:
+										# Both values are zero or sum to zero - no difference
 										difference = 0.0
 									else:
-										try:
-											difference = abs((abs(current_candle-memory_candle)/((current_candle+memory_candle)/2))*100)
-										except:
-											difference = 0.0
+										difference = abs((abs(current_candle - memory_candle) / avg_value) * 100)
 									checks.append(difference)
 									check_dex += 1
 									if check_dex >= len(current_pattern):
@@ -1125,10 +1153,10 @@ while True:
 						else:
 							perfect_threshold += 0.01
 					
-					# Clamp to reasonable bounds (prevents drift to unusable extremes)
-					# 0.01 = very strict matching, 10.0 = loose matching
-					# Previous bounds (0.0-100.0) allowed degenerate cases
-					perfect_threshold = max(0.01, min(10.0, perfect_threshold))
+					# Clamp to prevent negative or zero threshold (would break matching logic)
+					# No upper limit during training - let each timeframe discover its natural threshold
+					# Adaptive logic self-regulates based on match counts
+					perfect_threshold = max(0.01, perfect_threshold)
 					
 					debug_print(f"[DEBUG] TRAINER: perfect_threshold adjusted to {perfect_threshold:.4f} (matches: {len(unweighted)})")
 					
@@ -1357,12 +1385,11 @@ while True:
 									pass
 							else:
 								pass
-							try:
+							# Calculate and display bounce accuracy if we have data
+							if len(upordown4) > 0:
 								accuracy = (sum(upordown4)/len(upordown4))*100
 								formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 								print(f'Bounce Accuracy for last 100 Over Limit Candles: {formatted}%')
-							except:
-								pass
 							try:
 								print('current candle: '+str(len(price_list2)))
 							except:
@@ -1622,10 +1649,13 @@ while True:
 												perc_diff_now_actual = ((price2-new_y[0])/abs(new_y[0]))*100
 												high_perc_diff_now_actual = ((high_price2-new_y[0])/abs(new_y[0]))*100
 												low_perc_diff_now_actual = ((low_price2-new_y[0])/abs(new_y[0]))*100
-												try:
-													difference = abs((abs(current_prediction_price-float(price2))/((current_prediction_price+float(price2))/2))*100)
-												except:
+												# Calculate difference with explicit zero-division protection
+												avg_pred_price = (current_prediction_price + float(price2)) / 2
+												if avg_pred_price == 0.0:
+													# Both prediction and actual price are zero - treat as max difference
 													difference = 100.0
+												else:
+													difference = abs((abs(current_prediction_price - float(price2)) / avg_pred_price) * 100)
 												try:
 													try:
 														indy = 0
@@ -1754,11 +1784,15 @@ while True:
 										break
 									else:
 										continue
+								except (KeyboardInterrupt, SystemExit):
+									raise
 								except:
 									PrintException()
 									print("CRITICAL ERROR in prediction candle loop. Training cannot continue safely.")
 									mark_training_error("Prediction candle loop critical error")
 									sys.exit(1)
+							except (KeyboardInterrupt, SystemExit):
+								raise
 							except:
 								PrintException()
 								print("CRITICAL ERROR in candle processing. Training cannot continue safely.")
@@ -1771,6 +1805,8 @@ while True:
 					price_change_list = []
 					current_pattern = []
 					break
+				except (KeyboardInterrupt, SystemExit):
+					raise
 				except:
 					PrintException()
 					print("CRITICAL ERROR in main training loop. Training cannot continue safely.")
