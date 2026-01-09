@@ -143,10 +143,10 @@ CHART_BID_LINE = "#00BCD4"
 CHART_ACCOUNT_LINE = "#2196F3"
 
 # Font settings (Modern Segoe UI)
-LOG_FONT_FAMILY = "Consolas"
+LOG_FONT_FAMILY = "Cascadia Mono"
 LOG_FONT_SIZE = 8
 CHART_FONT_FAMILY = "Segoe UI"
-CHART_LABEL_FONT_SIZE = 8
+CHART_LABEL_FONT_SIZE = 9
 
 THEME_SETTINGS_FILE = "theme_settings.json"
 
@@ -174,10 +174,10 @@ DEFAULT_THEME = {
     "chart_account_line": CHART_ACCOUNT_LINE,
     "font_family": "Segoe UI",
     "font_size": 11,
-    "log_font_family": "Consolas",
+    "log_font_family": "Cascadia Mono",
     "log_font_size": 8,
     "chart_font_family": "Segoe UI",
-    "chart_label_font_size": 8
+    "chart_label_font_size": 9
 }
 
 def _load_theme_settings():
@@ -401,7 +401,7 @@ class NeuralSignalTile(ttk.Frame):
         # Marker lines based on entry signal config
         # LONG side marker (shows minimum long signal to start trades)
         trading_cfg = _load_trading_config()
-        long_min = trading_cfg.get("entry_signals", {}).get("long_signal_min", 3)
+        long_min = trading_cfg.get("entry_signals", {}).get("long_signal_min", 4)
         long_min = max(1, min(7, int(long_min)))  # Clamp to valid range 1-7
         
         long_trade_y = int(round(yb - ((long_min - 1) * self._bar_h / self._display_levels)))
@@ -486,7 +486,7 @@ class NeuralSignalTile(ttk.Frame):
     def update_marker_lines(self) -> None:
         """Update marker line positions based on current trading config."""
         trading_cfg = _load_trading_config()
-        long_min = trading_cfg.get("entry_signals", {}).get("long_signal_min", 3)
+        long_min = trading_cfg.get("entry_signals", {}).get("long_signal_min", 4)
         long_min = max(1, min(7, int(long_min)))  # Clamp to valid range 1-7
         
         short_max = trading_cfg.get("entry_signals", {}).get("short_signal_max", 0)
@@ -554,12 +554,13 @@ DEFAULT_TRADING_CONFIG = {
         "target_with_dca_pct": 2.5
     },
     "entry_signals": {
-        "long_signal_min": 3,
+        "long_signal_min": 4,
         "short_signal_max": 0
     },
     "position_sizing": {
         "initial_allocation_pct": 0.005,
-        "min_allocation_usd": 0.5
+        "min_allocation_usd": 0.5,
+        "risk_multiplier": 0.5
     },
     "timing": {
         "main_loop_delay_seconds": 0.5,
@@ -583,15 +584,25 @@ REQUIRED_THINKER_TIMEFRAMES = [
 DEFAULT_TRAINING_CONFIG = {
     "staleness_days": 14,
     "auto_train_when_stale": True,
-    "bounce_accuracy_tolerance": 0.5,
-    "bounce_accuracy_target": 70.0,
-    "min_pattern_weight": 0.1,
-    "learning_rate": 0.01,
-    "initial_perfect_threshold": 1.0,
-    "perfect_threshold_target": 10.0,
-    "target_matches_small": 10,
-    "target_matches_medium": 15,
-    "target_matches_large": 20,
+    "pruning_sigma_level": 2.0,
+    "pid_kp": 0.5,
+    "pid_ki": 0.005,
+    "pid_kd": 0.2,
+    "pid_integral_limit": 20,
+    "min_threshold": 1.0,
+    "max_threshold": 25.0,
+    "pattern_size": 3,
+    "weight_base_step": 0.25,
+    "weight_step_cap_multiplier": 2.0,
+    "weight_threshold_base": 0.1,
+    "weight_threshold_min": 0.03,
+    "weight_threshold_max": 0.2,
+    "volatility_ewma_decay": 0.9,
+    "weight_decay_rate": 0.001,
+    "weight_decay_target": 1.0,
+    "age_pruning_enabled": True,
+    "age_pruning_percentile": 0.10,
+    "age_pruning_weight_limit": 1.0,
     "timeframes": REQUIRED_THINKER_TIMEFRAMES
 }
 
@@ -1830,7 +1841,7 @@ class LogProc:
 class ApolloHub(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Apollo {VERSION.split('.')[0]}")
+        self.title(f"Apollo Trader {VERSION.split('.')[0]}")
         self.geometry("1400x820")
 
         # Set custom taskbar icon if at.ico exists
@@ -1964,7 +1975,8 @@ class ApolloHub(tk.Tk):
         self.after(250, self._tick)
         
         # Display bounce accuracy results on startup (after GUI is ready)
-        self.after(300, self._display_startup_bounce_accuracy)
+        # Increased delay to ensure all widgets are fully initialized
+        self.after(500, self._display_startup_bounce_accuracy)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -3810,7 +3822,10 @@ class ApolloHub(tk.Tk):
                 if not os.path.isfile(fpath):
                     return False
                 try:
-                    if os.path.getsize(fpath) < 10:  # At least 10 bytes
+                    # Threshold files contain single float values (e.g., "5.0", "25.0") and are legitimately small
+                    # Memory/weight files contain pattern data and should be larger
+                    min_size = 2 if "threshold" in os.path.basename(fpath) else 10
+                    if os.path.getsize(fpath) < min_size:
                         return False
                 except Exception:
                     return False
@@ -4237,83 +4252,124 @@ class ApolloHub(tk.Tk):
     def _display_startup_bounce_accuracy(self) -> None:
         """Display bounce accuracy results for all coins on Hub startup."""
         try:
-            for coin in self.coins:
-                coin_folder = self.coin_folders.get(coin)
-                if not coin_folder:
-                    continue
-                
-                accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
-                if not os.path.isfile(accuracy_file):
-                    continue
-                
-                try:
-                    with open(accuracy_file, 'r', encoding='utf-8') as f:
-                        lines = f.read().strip().split('\n')
-                    
-                    if len(lines) < 2:
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] _display_startup_bounce_accuracy() called")
+                print(f"[HUB DEBUG] Checking bounce accuracy for coins: {self.coins}")
+            
+            trained_coins_found = 0
+            
+            # Only check files if coins are configured
+            if self.coins:
+                for coin in self.coins:
+                    coin_folder = self.coin_folders.get(coin)
+                    if not coin_folder:
+                        if self.settings.get("debug_mode", False):
+                            print(f"[HUB DEBUG] No coin folder found for {coin}")
                         continue
                     
-                    # Parse file content
-                    timestamp = lines[0].replace('Last Updated: ', '').strip()
-                    average = lines[1].replace('Average: ', '').strip()
+                    accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
+                    if not os.path.isfile(accuracy_file):
+                        continue
                     
-                    # Build timeframe results string and check for suspicious accuracy
-                    tf_results = []
-                    suspicious_accuracy = False
-                    for line in lines[2:]:
-                        if ':' in line:
-                            tf_results.append(line.replace(': ', '=').strip())
-                            # Check if any timeframe has >= 99% accuracy
-                            try:
-                                accuracy_value = float(line.split(':')[1].strip().replace('%', ''))
-                                if accuracy_value >= 99.0:
-                                    suspicious_accuracy = True
-                            except:
-                                pass
-                    
-                    # Format and display
-                    msg = f"Bounce Accuracy Results ({coin})\n"
-                    msg += f"Last trained: {timestamp}\n"
-                    msg += f"Average accuracy: {average}\n"
-                    msg += f"Per timeframe: {', '.join(tf_results)}\n\n"
-                    
-                    # Add warning if suspicious accuracy detected
-                    if suspicious_accuracy:
-                        msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
-                        msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
-                        msg += f"\n\n"
-                    
-                    # Check if memory files are empty
-                    empty_memories = []
                     try:
+                        with open(accuracy_file, 'r', encoding='utf-8') as f:
+                            lines = f.read().strip().split('\n')
+                        
+                        if len(lines) < 2:
+                            continue
+                        
+                        # Parse file content
+                        timestamp = lines[0].replace('Last Updated: ', '').strip()
+                        average = lines[1].replace('Average: ', '').strip()
+                        
+                        # Build timeframe results string and check for suspicious accuracy
+                        tf_results = []
+                        suspicious_accuracy = False
                         for line in lines[2:]:
                             if ':' in line:
-                                tf = line.split(':')[0].strip()
-                                memory_file = os.path.join(coin_folder, f"memories_{tf}.dat")
-                                if os.path.isfile(memory_file):
-                                    file_size = os.path.getsize(memory_file)
-                                    if file_size < 100:
-                                        empty_memories.append(tf)
-                                else:
-                                    empty_memories.append(tf)
+                                tf_results.append(line.replace(': ', '=').strip())
+                                # Check if any timeframe has >= 99% accuracy
+                                try:
+                                    accuracy_value = float(line.split(':')[1].strip().replace('%', ''))
+                                    if accuracy_value >= 99.0:
+                                        suspicious_accuracy = True
+                                except:
+                                    pass
                         
-                        if empty_memories:
-                            msg += f"❌ ERROR: Memory files are empty or missing for: {', '.join(empty_memories)}\n"
-                            msg += f"❌ Training likely failed. Please retrain this coin.\n"
+                        # Use the same training validation logic as the training window
+                        if self._coin_is_trained(coin):
+                            trained_coins_found += 1
+                            if self.settings.get("debug_mode", False):
+                                print(f"[HUB DEBUG] Found fully trained coin: {coin} (total trained: {trained_coins_found})")
+                        else:
+                            if self.settings.get("debug_mode", False):
+                                print(f"[HUB DEBUG] Coin {coin} is not fully trained")
+                        
+                        # Format and display
+                        msg = f"Bounce Accuracy Results ({coin})\n"
+                        msg += f"Last trained: {timestamp}\n"
+                        msg += f"Average accuracy: {average}\n"
+                        msg += f"Per timeframe: {', '.join(tf_results)}\n\n"
+                        
+                        # Add warning if suspicious accuracy detected
+                        if suspicious_accuracy:
+                            msg += f"⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.\n"
+                            msg += f"⚠ Please verify that training completed properly and memories were saved.\n"
                             msg += f"\n\n"
-                    except:
-                        pass
+                        
+                        # Display error if coin is not fully trained
+                        if not self._coin_is_trained(coin):
+                            msg += f"❌ ERROR: Training incomplete - missing or invalid model files.\n"
+                            msg += f"❌ Please retrain this coin to complete the training process.\n"
+                            msg += f"\n\n"
+                        
+                        # Insert into trainer log
+                        self.trainer_text.insert("end", msg)
+                        self.trainer_text.see("end")
                     
-                    # Insert into trainer log
-                    self.trainer_text.insert("end", msg)
-                    self.trainer_text.see("end")
+                    except Exception as e:
+                        # Silently skip files that can't be read
+                        pass
+            
+            # If no trained coins were found, display a helpful message in Thinker log
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Final trained_coins_found count: {trained_coins_found}")
+            
+            if trained_coins_found == 0:
+                if self.settings.get("debug_mode", False):
+                    print(f"[HUB DEBUG] No trained coins found ({trained_coins_found}), displaying message in Thinker log")
                 
-                except Exception as e:
-                    # Silently skip files that can't be read
-                    pass
-        except Exception:
-            # Silently skip if there's any error
-            pass
+                msg = (
+                    "⚠ No trained coins detected\n\n"
+                    "The Thinker requires trained AI models to generate trading signals.\n"
+                    "Please train at least one coin before starting the Thinker:\n\n"
+                    "  1. Select a coin (BTC, ETH, etc.)\n"
+                    "  2. Click 'Train' or 'Train All'\n"
+                    "  3. Wait for training to complete (may take 10-30 minutes)\n"
+                    "  4. Once training finishes, the Thinker can be started\n\n"
+                    "Training creates AI memory patterns that predict price movements.\n"
+                )
+                
+                try:
+                    self.runner_text.insert("end", msg)
+                    self.runner_text.see("end")
+                    
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Message inserted into Thinker log successfully")
+                except Exception as insert_err:
+                    if self.settings.get("debug_mode", False):
+                        print(f"[HUB DEBUG] Failed to insert message: {insert_err}")
+                    # Try direct print as fallback
+                    print(msg)
+        except Exception as e:
+            # Log error if debug mode enabled
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Error in _display_startup_bounce_accuracy: {e}")
+                import traceback
+                traceback.print_exc()
+            else:
+                # If not in debug mode, at least print the error
+                print(f"Error checking trained coins: {e}")
 
     def _tick(self) -> None:
         # process labels
@@ -4450,22 +4506,22 @@ class ApolloHub(tk.Tk):
                 self.lbl_flow_hint.config(text=f"Flow: TRAIN ({len(pending)} coins) → THINK → TRADE")
             elif training_running:
                 # Training is actively running
-                self.lbl_flow_hint.config(text=f"Flow: TRAIN (in progress) → THINK → TRADE")
+                self.lbl_flow_hint.config(text=f"Flow: TRAIN ⧗ → THINK → TRADE")
             elif not all_trained:
                 # Training needed before anything else
                 self.lbl_flow_hint.config(text="Next: TRAIN → THINK → TRADE")
             elif self._auto_start_trader_pending:
                 # Training done, thinker starting
-                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK (starting) → TRADE")
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK ⧗ → TRADE")
             elif neural_running and trader_running:
                 # Everything is running
                 self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK ✓ → TRADE ✓")
             elif neural_running:
                 # Only neural/thinker is running
-                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK (active) → TRADE")
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK ⟳ → TRADE")
             elif trader_running:
                 # Only trader is running (unusual but possible)
-                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK → TRADE (active)")
+                self.lbl_flow_hint.config(text="Flow: TRAIN ✓ → THINK → TRADE ⟳")
             else:
                 # All trained, ready to start
                 self.lbl_flow_hint.config(text="Next: THINK → TRADE (training complete)")
@@ -4615,14 +4671,20 @@ class ApolloHub(tk.Tk):
         # Update simulation mode banner - show/hide as needed
         try:
             sim_mode = data.get("simulation_mode", False)
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Simulation mode status: {sim_mode}")
             if sim_mode:
                 self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
                 if not self.lbl_simulation_banner.winfo_ismapped():
                     self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4), before=self.lbl_acct_total_value)
+                    if self.settings.get("debug_mode", False):
+                        print("[HUB DEBUG] Simulation banner displayed")
             else:
                 self.lbl_simulation_banner.pack_forget()
-        except Exception:
-            pass
+        except Exception as e:
+            # Log error if debug mode enabled
+            if self.settings.get("debug_mode", False):
+                print(f"[HUB DEBUG] Failed to update simulation banner: {e}")
 
         # --- account summary (same info the trader prints above current trades) ---
         acct = data.get("account", {}) or {}
@@ -5342,10 +5404,21 @@ class ApolloHub(tk.Tk):
             except Exception:
                 pass
 
-        settings_canvas.bind("<Enter>", lambda _e: settings_canvas.focus_set(), add="+")
+        def _bind_mousewheel_recursive(widget):
+            """Recursively bind mouse wheel to widget and all children so it works everywhere."""
+            try:
+                widget.bind("<MouseWheel>", _wheel, add="+")
+                widget.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")
+                widget.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")
+                for child in widget.winfo_children():
+                    _bind_mousewheel_recursive(child)
+            except Exception:
+                pass
+
         settings_canvas.bind("<MouseWheel>", _wheel, add="+")  # Windows / Mac
         settings_canvas.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")  # Linux
         settings_canvas.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")   # Linux
+        _bind_mousewheel_recursive(frm)  # Bind to all child widgets
 
         # Make the entry column expand
         frm.columnconfigure(0, weight=0)  # labels
@@ -5640,31 +5713,50 @@ class ApolloHub(tk.Tk):
             # -----------------------------
             # Big, beginner-friendly instructions
             # -----------------------------
-            intro = (
+            intro_frame = ttk.Frame(container)
+            intro_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            intro_frame.columnconfigure(0, weight=1)
+            
+            intro_text = (
                 "This trader uses Robinhood's Crypto Trading API credentials.\n\n"
-                "You only do this once. When finished, pt_trader.py can authenticate automatically.\n\n"
+                "You only do this once. When finished, pt_trader.py can authenticate automatically."
+            )
+            ttk.Label(intro_frame, text=intro_text, justify="left", foreground=DARK_FG).grid(row=0, column=0, sticky="w")
+            
+            steps_text = (
                 "✅ What you will do in this window:\n"
                 "  1) Generate a Public Key + Private Key (Ed25519).\n"
                 "  2) Copy the PUBLIC key and paste it into Robinhood to create an API credential.\n"
                 "  3) Robinhood will show you an API Key (usually starts with 'rh...'). Copy it.\n"
-                "  4) Paste that API Key back here and click Save.\n\n"
+                "  4) Paste that API Key back here and click Save."
+            )
+            ttk.Label(intro_frame, text=steps_text, justify="left", foreground=DARK_FG, font=("TkDefaultFont", 9)).grid(row=1, column=0, sticky="w", pady=(10, 0))
+            
+            robinhood_text = (
                 "🧭 EXACTLY where to paste the Public Key on Robinhood (desktop web is best):\n"
                 "  A) Log in to Robinhood on a computer.\n"
                 "  B) Click Account (top-right) → Settings.\n"
                 "  C) Click Crypto.\n"
                 "  D) Scroll down to API Trading and click + Add Key (or Add key).\n"
                 "  E) Paste the Public Key into the Public key field.\n"
-                "  F) Give it any name (example: PowerTraderAI).\n"
+                "  F) Give it any name (example: ApolloTrader).\n"
                 "  G) Permissions: this TRADER needs READ + TRADE. (READ-only cannot place orders.)\n"
-                "  H) Click Save. Robinhood shows your API Key — copy it right away (it may only show once).\n\n"
-                "📱 Mobile note: if you can't find API Trading in the app, use robinhood.com in a browser.\n\n"
-                "This wizard will save two files in the same folder as pt_hub.py:\n"
-                "  - rh_key.enc    (your API Key, encrypted)\n"
-                "  - rh_secret.enc (your PRIVATE key in base64, encrypted)  ← keep this secret like a password\n"
+                "  H) Click Save. Robinhood shows your API Key — copy it right away (it may only show once)."
             )
-
-            intro_lbl = ttk.Label(container, text=intro, justify="left")
-            intro_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            ttk.Label(intro_frame, text=robinhood_text, justify="left", foreground=DARK_FG, font=("TkDefaultFont", 9)).grid(row=2, column=0, sticky="w", pady=(10, 0))
+            
+            mobile_note = "📱 Mobile note: if you can't find API Trading in the app, use robinhood.com in a browser."
+            ttk.Label(intro_frame, text=mobile_note, justify="left", foreground="orange", font=("TkDefaultFont", 9, "italic")).grid(row=3, column=0, sticky="w", pady=(10, 0))
+            
+            files_text = (
+                "This wizard will save two encrypted files in the same folder as pt_hub.py:\n"
+                "  • rh_key.enc    (your API Key, encrypted)\n"
+                "  • rh_secret.enc (your PRIVATE key in base64, encrypted)"
+            )
+            ttk.Label(intro_frame, text=files_text, justify="left", foreground=DARK_FG, font=("TkDefaultFont", 9)).grid(row=4, column=0, sticky="w", pady=(10, 0))
+            
+            security_warning = "⚠ Keep rh_secret.enc SECRET like a password! It grants full access to trade your crypto."
+            ttk.Label(intro_frame, text=security_warning, justify="left", foreground="orange", font=("TkDefaultFont", 9, "bold")).grid(row=5, column=0, sticky="w", pady=(10, 0))
 
             top_btns = ttk.Frame(container)
             top_btns.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -5784,7 +5876,7 @@ class ApolloHub(tk.Tk):
                 "In Robinhood, after you add the Public Key, Robinhood will show an API Key.\n"
                 "Paste that API Key below. (It often starts with 'rh.'.)"
             )
-            ttk.Label(step2, text=step2_help, justify="left").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
+            ttk.Label(step2, text=step2_help, justify="left", foreground=DARK_FG, font=("TkDefaultFont", 9)).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
 
             api_key_var = tk.StringVar(value=existing_api_key or "")
             api_ent = ttk.Entry(step2, textvariable=api_key_var)
@@ -5889,16 +5981,23 @@ class ApolloHub(tk.Tk):
             step3.grid(row=4, column=0, sticky="nsew")
             step3.columnconfigure(0, weight=1)
 
+            ttk.Label(
+                step3,
+                text="⚠ These encrypted files grant full trading access. Keep them secure!",
+                foreground="orange",
+                font=("TkDefaultFont", 9, "bold")
+            ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 8))
+
             ack_var = tk.BooleanVar(value=False)
             ack = ttk.Checkbutton(
                 step3,
                 text="I understand rh_secret.enc is PRIVATE (encrypted for my Windows account) and I will not share it.",
                 variable=ack_var,
             )
-            ack.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+            ack.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 6))
 
             save_btns = ttk.Frame(step3)
-            save_btns.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 12))
+            save_btns.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 12))
 
             def do_save():
                 api_key = (api_key_var.get() or "").strip()
@@ -6092,7 +6191,7 @@ class ApolloHub(tk.Tk):
                 if new_use_theme != prev_use_theme:
                     messagebox.showinfo(
                         "Saved", 
-                        "Settings saved.\n\nTheme setting changed — restart PowerTraderAI for full effect."
+                        "Settings saved.\n\nTheme setting changed — restart ApolloTrader for full effect."
                     )
                 else:
                     messagebox.showinfo("Saved", "Settings saved.")
@@ -6233,27 +6332,39 @@ class ApolloHub(tk.Tk):
             except Exception:
                 pass
 
-        settings_canvas.bind("<Enter>", lambda _e: settings_canvas.focus_set(), add="+")
+        def _bind_mousewheel_recursive(widget):
+            """Recursively bind mouse wheel to widget and all children so it works everywhere."""
+            try:
+                widget.bind("<MouseWheel>", _wheel, add="+")
+                widget.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")
+                widget.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")
+                for child in widget.winfo_children():
+                    _bind_mousewheel_recursive(child)
+            except Exception:
+                pass
+
         settings_canvas.bind("<MouseWheel>", _wheel, add="+")
         settings_canvas.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")
         settings_canvas.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")
+        _bind_mousewheel_recursive(frm)  # Bind to all child widgets
 
-        frm.columnconfigure(0, weight=0)  # labels
-        frm.columnconfigure(1, weight=1)  # entries
-
-        def add_row(parent, r: int, label: str, var: tk.Variable, explanation: str = ""):
-            ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
-            ttk.Entry(parent, textvariable=var, width=15).grid(row=r, column=1, sticky="w", pady=6)
-            if explanation:
-                ttk.Label(parent, text=explanation, foreground="gray").grid(row=r, column=2, sticky="w", padx=(10, 0), pady=6)
+        frm.columnconfigure(0, weight=0)
+        frm.columnconfigure(1, weight=1)
 
         r = 0
 
-        # DCA Section
+        # DCA (Dollar Cost Averaging) Section
         dca_frame = ttk.LabelFrame(frm, text=" DCA (Dollar Cost Averaging) ", padding=15)
         dca_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         dca_frame.columnconfigure(0, weight=0)
         dca_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            dca_frame,
+            text="Buy more when price drops to reduce average cost. Each level increases position size.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         dca_levels = cfg.get("dca", {}).get("levels", [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0])
 
@@ -6265,77 +6376,169 @@ class ApolloHub(tk.Tk):
             dca_levels = dca_levels[:MAX_DCA_LEVELS_UI]
 
         dca_level_vars = []
-        dca_r = 0
+        dca_r = 1
         for i, level in enumerate(dca_levels):
             dca_level_var = tk.StringVar(value=str(level))
             dca_level_vars.append(dca_level_var)
-            expl = "(must be negative, e.g., -2.5)" if i == 0 else ""
-            add_row(dca_frame, dca_r, f"DCA Level {i+1} (%):", dca_level_var, expl)
+            ttk.Label(dca_frame, text=f"DCA Level {i+1} (%):").grid(row=dca_r, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(dca_frame, textvariable=dca_level_var, width=15).grid(row=dca_r, column=1, sticky="w", pady=6)
             dca_r += 1
+            if i == 0:
+                ttk.Label(dca_frame, text="(must be negative, e.g., -2.5)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=dca_r, column=0, columnspan=2, sticky="w", pady=(0, 10))
+                dca_r += 1
 
+        ttk.Label(
+            dca_frame,
+            text="⚠ Levels must be negative and increasingly negative (e.g., -2.5, -5, -10). Each must be unique.",
+            foreground="orange",
+            font=("TkDefaultFont", 8, "bold")
+        ).grid(row=dca_r, column=0, columnspan=2, sticky="w", pady=(0, 15)); dca_r += 1
+
+        ttk.Label(dca_frame, text="Max DCA buys per window:").grid(row=dca_r, column=0, sticky="w", padx=(0, 10), pady=6)
         max_buys_var = tk.StringVar(value=str(cfg.get("dca", {}).get("max_buys_per_window", 2)))
-        add_row(dca_frame, dca_r, "Max DCA buys per window (count):", max_buys_var, "(limits additional buys)"); dca_r += 1
+        ttk.Entry(dca_frame, textvariable=max_buys_var, width=15).grid(row=dca_r, column=1, sticky="w", pady=6)
+        dca_r += 1
+        ttk.Label(dca_frame, text="Limits additional DCA purchases within time window", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=dca_r, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        dca_r += 1
 
+        ttk.Label(dca_frame, text="Window (hours):").grid(row=dca_r, column=0, sticky="w", padx=(0, 10), pady=6)
         window_hours_var = tk.StringVar(value=str(cfg.get("dca", {}).get("window_hours", 24)))
-        add_row(dca_frame, dca_r, "Window (hours):", window_hours_var, "(time window for counting DCA buys)"); dca_r += 1
+        ttk.Entry(dca_frame, textvariable=window_hours_var, width=15).grid(row=dca_r, column=1, sticky="w", pady=6)
+        dca_r += 1
+        ttk.Label(dca_frame, text="Time window for counting DCA buys", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=dca_r, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        dca_r += 1
 
+        ttk.Label(dca_frame, text="Position multiplier:").grid(row=dca_r, column=0, sticky="w", padx=(0, 10), pady=6)
         multiplier_var = tk.StringVar(value=str(cfg.get("dca", {}).get("position_multiplier", 2.0)))
-        add_row(dca_frame, dca_r, "Position multiplier (x):", multiplier_var, "(each DCA level buys x times more)"); dca_r += 1
+        ttk.Entry(dca_frame, textvariable=multiplier_var, width=15).grid(row=dca_r, column=1, sticky="w", pady=6)
+        dca_r += 1
+        ttk.Label(dca_frame, text="Each DCA level buys this multiple of previous level", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=dca_r, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Profit Margin Section
         profit_frame = ttk.LabelFrame(frm, text=" Profit Margin ", padding=15)
         profit_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         profit_frame.columnconfigure(0, weight=0)
         profit_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            profit_frame,
+            text="Trailing stop strategy: exits when price falls specified % below peak since entry.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         
-        profit_r = 0
+        ttk.Label(profit_frame, text="Trailing gap (%):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
         trailing_gap_var = tk.StringVar(value=str(cfg.get("profit_margin", {}).get("trailing_gap_pct", 0.5)))
-        add_row(profit_frame, profit_r, "Trailing gap (%):", trailing_gap_var, "(distance below peak to trigger sell)"); profit_r += 1
+        ttk.Entry(profit_frame, textvariable=trailing_gap_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(profit_frame, text="Distance below peak to trigger sell", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
+        ttk.Label(profit_frame, text="Target without DCA (%):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         target_no_dca_var = tk.StringVar(value=str(cfg.get("profit_margin", {}).get("target_no_dca_pct", 5.0)))
-        add_row(profit_frame, profit_r, "Target without DCA (%):", target_no_dca_var, "(profit target for initial entry only)"); profit_r += 1
+        ttk.Entry(profit_frame, textvariable=target_no_dca_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(profit_frame, text="Profit target for initial entry only", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
+        ttk.Label(profit_frame, text="Target with DCA (%):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
         target_with_dca_var = tk.StringVar(value=str(cfg.get("profit_margin", {}).get("target_with_dca_pct", 2.5)))
-        add_row(profit_frame, profit_r, "Target with DCA (%):", target_with_dca_var, "(profit target when DCA triggered)"); profit_r += 1
+        ttk.Entry(profit_frame, textvariable=target_with_dca_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Label(profit_frame, text="Profit target when DCA has triggered", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            profit_frame,
+            text="Note: Lower target with DCA helps exit averaged-down positions faster",
+            foreground=DARK_FG,
+            font=("TkDefaultFont", 8, "italic")
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         # Entry Signals Section
         entry_frame = ttk.LabelFrame(frm, text=" Entry Signals ", padding=15)
         entry_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         entry_frame.columnconfigure(0, weight=0)
         entry_frame.columnconfigure(1, weight=1)
-        
-        entry_r = 0
-        long_min_var = tk.StringVar(value=str(cfg.get("entry_signals", {}).get("long_signal_min", 3)))
-        add_row(entry_frame, entry_r, "Long signal minimum (1-7):", long_min_var, "(AI signal strength to buy)"); entry_r += 1
+        entry_frame.columnconfigure(2, weight=0)
 
+        ttk.Label(
+            entry_frame,
+            text="AI generates 0-7 signals. Higher numbers = stronger prediction. Minimum threshold triggers trades.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        
+        ttk.Label(entry_frame, text="Long signal minimum (1-7):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        long_min_var = tk.StringVar(value=str(cfg.get("entry_signals", {}).get("long_signal_min", 4)))
+        ttk.Entry(entry_frame, textvariable=long_min_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(entry_frame, text="AI signal strength required to enter buy", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(entry_frame, text="Short signal maximum (0-7):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         short_max_var = tk.StringVar(value=str(cfg.get("entry_signals", {}).get("short_signal_max", 0)))
-        add_row(entry_frame, entry_r, "Short signal maximum (0-7):", short_max_var, "(currently unused - reserved)"); entry_r += 1
+        ttk.Entry(entry_frame, textvariable=short_max_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(entry_frame, text="Reserved for future short trading (unused)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Position Sizing Section
         position_frame = ttk.LabelFrame(frm, text=" Position Sizing ", padding=15)
         position_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         position_frame.columnconfigure(0, weight=0)
         position_frame.columnconfigure(1, weight=1)
-        
-        position_r = 0
-        allocation_var = tk.StringVar(value=str(cfg.get("position_sizing", {}).get("initial_allocation_pct", 0.005)))
-        add_row(position_frame, position_r, "Initial allocation (%):", allocation_var, "(% of account for first buy)"); position_r += 1
+        position_frame.columnconfigure(2, weight=0)
 
+
+        ttk.Label(
+            position_frame,
+            text="Determines how much to invest per trade based on account balance and risk management.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        
+        ttk.Label(position_frame, text="Initial allocation (%):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        allocation_var = tk.StringVar(value=str(cfg.get("position_sizing", {}).get("initial_allocation_pct", 0.005)))
+        ttk.Entry(position_frame, textvariable=allocation_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(position_frame, text="Percentage of account for first buy", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(position_frame, text="Minimum allocation ($):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         min_alloc_var = tk.StringVar(value=str(cfg.get("position_sizing", {}).get("min_allocation_usd", 0.5)))
-        add_row(position_frame, position_r, "Minimum allocation ($):", min_alloc_var, "(floor for position size)"); position_r += 1
+        ttk.Entry(position_frame, textvariable=min_alloc_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(position_frame, text="Floor for position size in dollars", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(position_frame, text="Risk multiplier:").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
+        risk_multiplier_var = tk.StringVar(value=str(cfg.get("position_sizing", {}).get("risk_multiplier", 0.5)))
+        ttk.Entry(position_frame, textvariable=risk_multiplier_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
+        ttk.Label(position_frame, text="Fractional Kelly criterion (0.5 = half Kelly)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            position_frame,
+            text="⚠ Risk multiplier controls leverage. 0.5 is conservative (half Kelly), 1.0 is aggressive (full Kelly).",
+            foreground="orange",
+            font=("TkDefaultFont", 8, "bold")
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         # Timing Section
         timing_frame = ttk.LabelFrame(frm, text=" Timing ", padding=15)
         timing_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         timing_frame.columnconfigure(0, weight=0)
         timing_frame.columnconfigure(1, weight=1)
-        
-        timing_r = 0
-        loop_delay_var = tk.StringVar(value=str(cfg.get("timing", {}).get("main_loop_delay_seconds", 0.5)))
-        add_row(timing_frame, timing_r, "Main loop delay (seconds):", loop_delay_var, "(pause between trade checks)"); timing_r += 1
 
+        ttk.Label(
+            timing_frame,
+            text="Controls how frequently the trading bot checks for opportunities and cooldown periods.",
+            foreground=DARK_FG,
+            wraplength=550
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        
+        ttk.Label(timing_frame, text="Main loop delay (seconds):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
+        loop_delay_var = tk.StringVar(value=str(cfg.get("timing", {}).get("main_loop_delay_seconds", 0.5)))
+        ttk.Entry(timing_frame, textvariable=loop_delay_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(timing_frame, text="Pause between trade checks", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(timing_frame, text="Post-trade delay (seconds):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
         post_trade_var = tk.StringVar(value=str(cfg.get("timing", {}).get("post_trade_delay_seconds", 5)))
-        add_row(timing_frame, timing_r, "Post-trade delay (seconds):", post_trade_var, "(cooldown after executing trade)"); timing_r += 1
+        ttk.Entry(timing_frame, textvariable=post_trade_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(timing_frame, text="Cooldown after executing trade", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            timing_frame,
+            text="Note: Lower delays = more responsive but higher API usage",
+            foreground=DARK_FG,
+            font=("TkDefaultFont", 8, "italic")
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         # Buttons
         btns = ttk.Frame(frm)
@@ -6359,6 +6562,7 @@ class ApolloHub(tk.Tk):
                 
                 alloc_pct = float(allocation_var.get())
                 min_alloc = float(min_alloc_var.get())
+                risk_multiplier = float(risk_multiplier_var.get())
                 
                 loop_delay = float(loop_delay_var.get())
                 post_trade = float(post_trade_var.get())
@@ -6432,6 +6636,9 @@ class ApolloHub(tk.Tk):
                 if min_alloc < 0:
                     messagebox.showerror("Validation Error", "Minimum allocation must be non-negative")
                     return
+                if not (0 < risk_multiplier <= 1.0):
+                    messagebox.showerror("Validation Error", "Risk multiplier must be between 0 and 1.0 (fractional Kelly)")
+                    return
 
                 # Timing
                 if loop_delay <= 0:
@@ -6460,7 +6667,8 @@ class ApolloHub(tk.Tk):
                     },
                     "position_sizing": {
                         "initial_allocation_pct": alloc_pct,
-                        "min_allocation_usd": min_alloc
+                        "min_allocation_usd": min_alloc,
+                        "risk_multiplier": risk_multiplier
                     },
                     "timing": {
                         "main_loop_delay_seconds": loop_delay,
@@ -6502,13 +6710,14 @@ class ApolloHub(tk.Tk):
                 
                 # Reset Entry Signals fields
                 entry = defaults.get("entry_signals", {})
-                long_min_var.set(str(entry.get("long_signal_min", 3)))
+                long_min_var.set(str(entry.get("long_signal_min", 4)))
                 short_max_var.set(str(entry.get("short_signal_max", 0)))
                 
                 # Reset Position Sizing fields
                 position = defaults.get("position_sizing", {})
                 allocation_var.set(str(position.get("initial_allocation_pct", 0.005)))
                 min_alloc_var.set(str(position.get("min_allocation_usd", 0.5)))
+                risk_multiplier_var.set(str(position.get("risk_multiplier", 0.5)))
                 
                 # Reset Timing fields
                 timing = defaults.get("timing", {})
@@ -6623,10 +6832,21 @@ class ApolloHub(tk.Tk):
             except Exception:
                 pass
 
-        settings_canvas.bind("<Enter>", lambda _e: settings_canvas.focus_set(), add="+")
+        def _bind_mousewheel_recursive(widget):
+            """Recursively bind mouse wheel to widget and all children so it works everywhere."""
+            try:
+                widget.bind("<MouseWheel>", _wheel, add="+")
+                widget.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")
+                widget.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")
+                for child in widget.winfo_children():
+                    _bind_mousewheel_recursive(child)
+            except Exception:
+                pass
+
         settings_canvas.bind("<MouseWheel>", _wheel, add="+")
         settings_canvas.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")
         settings_canvas.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")
+        _bind_mousewheel_recursive(frm)  # Bind to all child widgets
 
         frm.columnconfigure(0, weight=0)
         frm.columnconfigure(1, weight=1)
@@ -6656,148 +6876,179 @@ class ApolloHub(tk.Tk):
         chk = ttk.Checkbutton(general_frame, text="Automatically retrain when stale", variable=auto_train_var)
         chk.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
-        # Pattern Matching Settings Section
-        pattern_frame = ttk.LabelFrame(frm, text=" Pattern Matching Settings ", padding=15)
-        pattern_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
-        pattern_frame.columnconfigure(0, weight=0)
-        pattern_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            pattern_frame,
-            text="Target number of similar patterns to find during AI training.\nValues adjust based on pattern library size:",
-            foreground=DARK_FG,
-            wraplength=550,
-            justify="left"
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        # Small library target
-        ttk.Label(pattern_frame, text="Small library target:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        target_small_var = tk.StringVar(value=str(cfg.get("target_matches_small", 10)))
-        ttk.Entry(pattern_frame, textvariable=target_small_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Label(pattern_frame, text="(< 5,000 patterns)", foreground="gray").grid(row=1, column=2, sticky="w", padx=(10, 0), pady=6)
-
-        # Medium library target
-        ttk.Label(pattern_frame, text="Medium library target:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
-        target_medium_var = tk.StringVar(value=str(cfg.get("target_matches_medium", 15)))
-        ttk.Entry(pattern_frame, textvariable=target_medium_var, width=15).grid(row=2, column=1, sticky="w", pady=6)
-        ttk.Label(pattern_frame, text="(5,000 - 50,000 patterns)", foreground="gray").grid(row=2, column=2, sticky="w", padx=(10, 0), pady=6)
-
-        # Large library target
-        ttk.Label(pattern_frame, text="Large library target:").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        target_large_var = tk.StringVar(value=str(cfg.get("target_matches_large", 20)))
-        ttk.Entry(pattern_frame, textvariable=target_large_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
-        ttk.Label(pattern_frame, text="(> 50,000 patterns)", foreground="gray").grid(row=3, column=2, sticky="w", padx=(10, 0), pady=6)
-
-        # Accuracy Settings Section
-        accuracy_frame = ttk.LabelFrame(frm, text=" Accuracy Settings ", padding=15)
-        accuracy_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
-        accuracy_frame.columnconfigure(0, weight=0)
-        accuracy_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            accuracy_frame,
-            text="Controls how strictly the AI evaluates pattern accuracy:",
-            foreground=DARK_FG,
-            wraplength=550
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        # Bounce accuracy target
-        ttk.Label(accuracy_frame, text="Target accuracy (%):").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        accuracy_target_var = tk.StringVar(value=str(cfg.get("bounce_accuracy_target", 70.0)))
-        ttk.Entry(accuracy_frame, textvariable=accuracy_target_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
-
-        ttk.Label(
-            accuracy_frame,
-            text="Goal accuracy for pattern quality scoring",
-            foreground=DARK_FG,
-            font=("TkDefaultFont", 8)
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        # Bounce accuracy tolerance
-        ttk.Label(accuracy_frame, text="Accuracy tolerance (± %):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        accuracy_tolerance_var = tk.StringVar(value=str(cfg.get("bounce_accuracy_tolerance", 0.5)))
-        ttk.Entry(accuracy_frame, textvariable=accuracy_tolerance_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
-
-        ttk.Label(
-            accuracy_frame,
-            text="Allowed variance when checking pattern prediction limits",
-            foreground=DARK_FG,
-            font=("TkDefaultFont", 8)
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 0))
-
         # Learning Settings Section
         learning_frame = ttk.LabelFrame(frm, text=" Learning Settings ", padding=15)
         learning_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
         learning_frame.columnconfigure(0, weight=0)
         learning_frame.columnconfigure(1, weight=1)
 
+        # Pattern size (moved from Pattern Quality)
+        ttk.Label(learning_frame, text="Pattern size (candles):").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        pattern_size_var = tk.StringVar(value=str(cfg.get("pattern_size", 3)))
+        ttk.Entry(learning_frame, textvariable=pattern_size_var, width=15).grid(row=0, column=1, sticky="w", pady=6)
+
         ttk.Label(
             learning_frame,
-            text="Controls how aggressively the AI adjusts weights during training:",
+            text="Number of candles per pattern (2-5 range; 3=balanced, 5=specific). ⚠ Changing requires full retrain!",
+            foreground="orange",
+            font=("TkDefaultFont", 8, "bold")
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        ttk.Label(
+            learning_frame,
+            text="PID controller adaptively adjusts similarity threshold for optimal pattern matching:",
             foreground=DARK_FG,
             wraplength=550
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-
-        # Base learning rate
-        ttk.Label(learning_frame, text="Learning rate:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        learning_rate_var = tk.StringVar(value=str(cfg.get("learning_rate", 0.01)))
-        ttk.Entry(learning_frame, textvariable=learning_rate_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
-
-        ttk.Label(
-            learning_frame,
-            text="Adjustment increment per candle. Smaller = slower but more stable training.",
-            foreground=DARK_FG,
-            font=("TkDefaultFont", 8)
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # Initial perfect threshold
-        ttk.Label(learning_frame, text="Initial threshold (%):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
-        initial_threshold_var = tk.StringVar(value=str(cfg.get("initial_perfect_threshold", 1.0)))
-        ttk.Entry(learning_frame, textvariable=initial_threshold_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+        # Kp (Proportional gain)
+        ttk.Label(learning_frame, text="Kp (Proportional):").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=6)
+        pid_kp_var = tk.StringVar(value=str(cfg.get("pid_kp", 0.5)))
+        ttk.Entry(learning_frame, textvariable=pid_kp_var, width=15).grid(row=3, column=1, sticky="w", pady=6)
+
+        # Ki (Integral gain)
+        ttk.Label(learning_frame, text="Ki (Integral):").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
+        pid_ki_var = tk.StringVar(value=str(cfg.get("pid_ki", 0.005)))
+        ttk.Entry(learning_frame, textvariable=pid_ki_var, width=15).grid(row=4, column=1, sticky="w", pady=6)
+
+        # Kd (Derivative gain)
+        ttk.Label(learning_frame, text="Kd (Derivative):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
+        pid_kd_var = tk.StringVar(value=str(cfg.get("pid_kd", 0.2)))
+        ttk.Entry(learning_frame, textvariable=pid_kd_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
+
+        # Integral limit
+        ttk.Label(learning_frame, text="Integral limit:").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
+        pid_limit_var = tk.StringVar(value=str(cfg.get("pid_integral_limit", 20)))
+        ttk.Entry(learning_frame, textvariable=pid_limit_var, width=15).grid(row=6, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
-            text="Starting pattern matching threshold when training begins (e.g., 10.0 = 10%)",
+            text="PID gains: Kp=response speed, Ki=steady-state correction, Kd=damping. Leave defaults unless tuning.",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # Perfect threshold target
-        ttk.Label(learning_frame, text="Target threshold (%):").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=6)
-        threshold_target_var = tk.StringVar(value=str(cfg.get("perfect_threshold_target", 10.0)))
-        ttk.Entry(learning_frame, textvariable=threshold_target_var, width=15).grid(row=5, column=1, sticky="w", pady=6)
+        # Minimum threshold
+        ttk.Label(learning_frame, text="Min threshold (%):").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=6)
+        min_threshold_var = tk.StringVar(value=str(cfg.get("min_threshold", 1.0)))
+        ttk.Entry(learning_frame, textvariable=min_threshold_var, width=15).grid(row=8, column=1, sticky="w", pady=6)
 
         ttk.Label(
             learning_frame,
-            text="Goal threshold for pattern matching convergence (e.g., 10.0 = 10%)",
+            text="Lower limit for threshold adjustment (prevents too strict matching)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # Pattern Quality Settings Section
-        quality_frame = ttk.LabelFrame(frm, text=" Pattern Quality Settings ", padding=15)
-        quality_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
-        quality_frame.columnconfigure(0, weight=0)
-        quality_frame.columnconfigure(1, weight=1)
+        # Maximum threshold
+        ttk.Label(learning_frame, text="Max threshold (%):").grid(row=10, column=0, sticky="w", padx=(0, 10), pady=6)
+        max_threshold_var = tk.StringVar(value=str(cfg.get("max_threshold", 20.0)))
+        ttk.Entry(learning_frame, textvariable=max_threshold_var, width=15).grid(row=10, column=1, sticky="w", pady=6)
 
         ttk.Label(
-            quality_frame,
-            text="Controls which patterns are kept or discarded:",
+            learning_frame,
+            text="Upper limit for threshold adjustment (prevents too loose matching)",
             foreground=DARK_FG,
+            font=("TkDefaultFont", 8)
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(
+            learning_frame,
+            text="Note: Initial and target thresholds will be the average of min and max",
+            foreground=DARK_FG,
+            font=("TkDefaultFont", 8, "italic")
+        ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, 0))
+
+        # Advanced Weight System Section
+        advanced_frame = ttk.LabelFrame(frm, text=" Advanced Weight System ", padding=15)
+        advanced_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(0, 15)); r += 1
+        advanced_frame.columnconfigure(0, weight=0)
+        advanced_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            advanced_frame,
+            text="⚠ Research-backed optimizations for high bounce accuracy. Default values are tuned. Only modify if you understand learning crypto dynamics.",
+            foreground="orange",
+            font=("TkDefaultFont", 9, "bold"),
             wraplength=550
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 15))
 
-        # Minimum pattern weight
-        ttk.Label(quality_frame, text="Minimum pattern weight:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
-        min_weight_var = tk.StringVar(value=str(cfg.get("min_pattern_weight", 0.1)))
-        ttk.Entry(quality_frame, textvariable=min_weight_var, width=15).grid(row=1, column=1, sticky="w", pady=6)
+        # Error-Proportional Scaling
+        ttk.Label(advanced_frame, text="Error-Proportional Scaling", font=("TkDefaultFont", 9, "bold")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        
+        ttk.Label(advanced_frame, text="Base weight step:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_base_step_var = tk.StringVar(value=str(cfg.get("weight_base_step", 0.25)))
+        ttk.Entry(advanced_frame, textvariable=weight_base_step_var, width=15).grid(row=2, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Base adjustment step size (0.1-0.5 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Max step multiplier:").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_step_cap_var = tk.StringVar(value=str(cfg.get("weight_step_cap_multiplier", 2.0)))
+        ttk.Entry(advanced_frame, textvariable=weight_step_cap_var, width=15).grid(row=4, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Cap on error-based scaling (1.5-3.0 range, higher = faster large error correction)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        # Volatility-Adaptive Thresholds
+        ttk.Label(advanced_frame, text="Volatility-Adaptive Thresholds", font=("TkDefaultFont", 9, "bold")).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        
+        ttk.Label(advanced_frame, text="Base threshold multiplier:").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_threshold_base_var = tk.StringVar(value=str(cfg.get("weight_threshold_base", 0.1)))
+        ttk.Entry(advanced_frame, textvariable=weight_threshold_base_var, width=15).grid(row=7, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Starting point for adaptive thresholds (0.05-0.15 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Min threshold multiplier:").grid(row=9, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_threshold_min_var = tk.StringVar(value=str(cfg.get("weight_threshold_min", 0.03)))
+        ttk.Entry(advanced_frame, textvariable=weight_threshold_min_var, width=15).grid(row=9, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Floor for adaptive thresholds in calm markets (0.01-0.05 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Max threshold multiplier:").grid(row=11, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_threshold_max_var = tk.StringVar(value=str(cfg.get("weight_threshold_max", 0.2)))
+        ttk.Entry(advanced_frame, textvariable=weight_threshold_max_var, width=15).grid(row=11, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Ceiling for adaptive thresholds in volatile markets (0.15-0.3 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Volatility smoothing:").grid(row=13, column=0, sticky="w", padx=(0, 10), pady=6)
+        volatility_ewma_var = tk.StringVar(value=str(cfg.get("volatility_ewma_decay", 0.9)))
+        ttk.Entry(advanced_frame, textvariable=volatility_ewma_var, width=15).grid(row=13, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="EWMA decay for volatility tracking (0.8-0.95 range, higher = smoother)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=14, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        # Temporal Decay
+        ttk.Label(advanced_frame, text="Temporal Decay", font=("TkDefaultFont", 9, "bold")).grid(row=15, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        
+        ttk.Label(advanced_frame, text="Weight decay rate:").grid(row=16, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_decay_rate_var = tk.StringVar(value=str(cfg.get("weight_decay_rate", 0.001)))
+        ttk.Entry(advanced_frame, textvariable=weight_decay_rate_var, width=15).grid(row=16, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Rate weights decay toward baseline per validation (0.0001-0.01 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=17, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Weight decay target:").grid(row=18, column=0, sticky="w", padx=(0, 10), pady=6)
+        weight_decay_target_var = tk.StringVar(value=str(cfg.get("weight_decay_target", 1.0)))
+        ttk.Entry(advanced_frame, textvariable=weight_decay_target_var, width=15).grid(row=18, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Target weight for decay (usually 1.0 = neutral baseline)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=19, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        # Pruning sigma level (moved from Pattern Quality)
+        ttk.Label(advanced_frame, text="Pruning sigma level:").grid(row=20, column=0, sticky="w", padx=(0, 10), pady=6)
+        pruning_sigma_var = tk.StringVar(value=str(cfg.get("pruning_sigma_level", 2.0)))
+        ttk.Entry(advanced_frame, textvariable=pruning_sigma_var, width=15).grid(row=20, column=1, sticky="w", pady=6)
 
         ttk.Label(
-            quality_frame,
-            text="Patterns with weights below this threshold are pruned (removed) before saving",
+            advanced_frame,
+            text="Patterns with weight < (mean - sigma × std_dev) are pruned. Higher = more aggressive pruning (1.5-3.0 range)",
             foreground=DARK_FG,
             font=("TkDefaultFont", 8)
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 0))
+        ).grid(row=21, column=0, columnspan=2, sticky="w", pady=(0, 15))
+
+        # Age-Based Pruning
+        ttk.Label(advanced_frame, text="Age-Based Pruning", font=("TkDefaultFont", 9, "bold")).grid(row=22, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        
+        age_pruning_enabled_var = tk.BooleanVar(value=bool(cfg.get("age_pruning_enabled", True)))
+        ttk.Checkbutton(advanced_frame, text="Enable age-based pruning", variable=age_pruning_enabled_var).grid(row=23, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        
+        ttk.Label(advanced_frame, text="Age pruning percentile:").grid(row=24, column=0, sticky="w", padx=(0, 10), pady=6)
+        age_pruning_percentile_var = tk.StringVar(value=str(cfg.get("age_pruning_percentile", 0.10)))
+        ttk.Entry(advanced_frame, textvariable=age_pruning_percentile_var, width=15).grid(row=24, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Fraction of oldest patterns to consider for removal (0.05-0.20 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=25, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ttk.Label(advanced_frame, text="Age pruning weight limit:").grid(row=26, column=0, sticky="w", padx=(0, 10), pady=6)
+        age_pruning_weight_var = tk.StringVar(value=str(cfg.get("age_pruning_weight_limit", 1.0)))
+        ttk.Entry(advanced_frame, textvariable=age_pruning_weight_var, width=15).grid(row=26, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="Only prune old patterns below this weight (0.5-1.5 range)", foreground=DARK_FG, font=("TkDefaultFont", 8)).grid(row=27, column=0, columnspan=2, sticky="w", pady=(0, 0))
 
         # Timeframes Section with Checkboxes
         timeframes_frame = ttk.LabelFrame(frm, text=" Allowed Timeframes ", padding=15)
@@ -6835,6 +7086,98 @@ class ApolloHub(tk.Tk):
             justify="left"
         ).grid(row=1, column=0, sticky="w", pady=5)
 
+        # Delete training data button
+        def delete_training_data():
+            """Delete all training data files for all coins (fresh start)."""
+            coins_list = ', '.join(self.coins) if self.coins else 'No coins configured'
+            confirm = messagebox.askyesno(
+                "Delete Training Data",
+                f"This will delete ALL training data for all coins:\n\n{coins_list}\n\n"
+                "This includes:\n"
+                "• All pattern memories\n"
+                "• All learned weights\n"
+                "• Threshold convergence data\n"
+                "• Training timestamps\n\n"
+                "You will need to retrain from scratch.\n\n"
+                "Are you sure you want to continue?",
+                icon='warning'
+            )
+            
+            if not confirm:
+                return
+            
+            deleted_count = 0
+            error_count = 0
+            
+            for coin in self.coins:
+                folder = self.coin_folders.get(coin, "")
+                if not folder or not os.path.isdir(folder):
+                    continue
+                
+                # Training files to delete (per timeframe)
+                for tf in REQUIRED_THINKER_TIMEFRAMES:
+                    files_to_delete = [
+                        f"memories_{tf}.dat",
+                        f"memory_weights_{tf}.dat",
+                        f"memory_weights_high_{tf}.dat",
+                        f"memory_weights_low_{tf}.dat",
+                        f"neural_perfect_threshold_{tf}.dat"
+                    ]
+                    
+                    for filename in files_to_delete:
+                        filepath = os.path.join(folder, filename)
+                        try:
+                            if os.path.exists(filepath):
+                                os.remove(filepath)
+                                deleted_count += 1
+                        except Exception:
+                            error_count += 1
+                
+                # Delete training status files
+                status_files = [
+                    "trainer_last_training_time.txt",
+                    "trainer_status.json"
+                ]
+                
+                for filename in status_files:
+                    filepath = os.path.join(folder, filename)
+                    try:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                            deleted_count += 1
+                    except Exception:
+                        error_count += 1
+            
+            if error_count > 0:
+                messagebox.showwarning(
+                    "Partial Success",
+                    f"Deleted {deleted_count} files.\n\n"
+                    f"Failed to delete {error_count} files (may be in use or locked)."
+                )
+            else:
+                messagebox.showinfo(
+                    "Success",
+                    f"Successfully deleted {deleted_count} training data files.\n\n"
+                    "All coins will need to be retrained before trading."
+                )
+        
+        delete_btn_frame = ttk.Frame(timeframes_frame)
+        delete_btn_frame.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        
+        ttk.Button(
+            delete_btn_frame,
+            text="Delete All Training Data",
+            command=delete_training_data,
+            style="Danger.TButton"  # Red/warning style if available
+        ).pack(side="left", padx=(0, 5))
+        
+        ttk.Label(
+            delete_btn_frame,
+            text="(Clears all learned patterns for fresh retrain)",
+            foreground="gray",
+            font=("TkDefaultFont", 8)
+        ).pack(side="left")
+
         # Buttons at bottom
         btns_frame = ttk.Frame(frm)
         btns_frame.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(10, 0)); r += 1
@@ -6847,57 +7190,113 @@ class ApolloHub(tk.Tk):
                     messagebox.showerror("Validation Error", "Staleness threshold must be at least 1 day")
                     return
                 
-                target_small = int(target_small_var.get())
-                target_medium = int(target_medium_var.get())
-                target_large = int(target_large_var.get())
-                if target_small < 1 or target_medium < 1 or target_large < 1:
-                    messagebox.showerror("Validation Error", "Target matches must be at least 1")
+                # PID Controller parameters
+                pid_kp = float(pid_kp_var.get())
+                pid_ki = float(pid_ki_var.get())
+                pid_kd = float(pid_kd_var.get())
+                pid_limit = float(pid_limit_var.get())
+                
+                if pid_kp <= 0 or pid_ki <= 0 or pid_kd <= 0:
+                    messagebox.showerror("Validation Error", "PID gains (Kp, Ki, Kd) must be greater than 0")
+                    return
+                if pid_limit <= 0:
+                    messagebox.showerror("Validation Error", "PID integral limit must be greater than 0")
                     return
                 
-                accuracy_target = float(accuracy_target_var.get())
-                accuracy_tolerance = float(accuracy_tolerance_var.get())
-                if accuracy_target < 0 or accuracy_target > 100:
-                    messagebox.showerror("Validation Error", "Target accuracy must be between 0 and 100")
+                min_threshold = float(min_threshold_var.get())
+                max_threshold = float(max_threshold_var.get())
+                if min_threshold < 0 or min_threshold > 100:
+                    messagebox.showerror("Validation Error", "Min threshold must be between 0 and 100")
                     return
-                if accuracy_tolerance < 0:
-                    messagebox.showerror("Validation Error", "Accuracy tolerance must be non-negative")
+                if max_threshold < 0 or max_threshold > 100:
+                    messagebox.showerror("Validation Error", "Max threshold must be between 0 and 100")
                     return
-                
-                learning_rate = float(learning_rate_var.get())
-                initial_threshold = float(initial_threshold_var.get())
-                threshold_target = float(threshold_target_var.get())
-                if learning_rate <= 0:
-                    messagebox.showerror("Validation Error", "Learning rate must be greater than 0")
-                    return
-                if initial_threshold < 0 or initial_threshold > 100:
-                    messagebox.showerror("Validation Error", "Initial threshold must be between 0 and 100")
-                    return
-                if threshold_target < 0 or threshold_target > 100:
-                    messagebox.showerror("Validation Error", "Target threshold must be between 0 and 100")
+                if min_threshold >= max_threshold:
+                    messagebox.showerror("Validation Error", "Min threshold must be less than max threshold")
                     return
                 
-                min_weight = float(min_weight_var.get())
-                if min_weight < 0 or min_weight > 1:
-                    messagebox.showerror("Validation Error", "Minimum pattern weight must be between 0 and 1")
+                pruning_sigma = float(pruning_sigma_var.get())
+                if pruning_sigma < 0:
+                    messagebox.showerror("Validation Error", "Pruning sigma level must be non-negative")
                     return
                 
-                # Read existing config to preserve timeframes (which may be manually edited)
+                pattern_size = int(pattern_size_var.get())
+                if pattern_size < 2 or pattern_size > 10:
+                    messagebox.showerror("Validation Error", "Pattern size must be between 2 and 10 candles")
+                    return
+                
+                # Validate Phase 1-4 parameters
+                weight_base_step = float(weight_base_step_var.get())
+                weight_step_cap = float(weight_step_cap_var.get())
+                weight_threshold_base = float(weight_threshold_base_var.get())
+                weight_threshold_min = float(weight_threshold_min_var.get())
+                weight_threshold_max = float(weight_threshold_max_var.get())
+                volatility_ewma = float(volatility_ewma_var.get())
+                weight_decay_rate = float(weight_decay_rate_var.get())
+                weight_decay_target = float(weight_decay_target_var.get())
+                age_pruning_percentile = float(age_pruning_percentile_var.get())
+                age_pruning_weight = float(age_pruning_weight_var.get())
+                
+                # Validate ranges
+                if weight_base_step < 0.05 or weight_base_step > 1.0:
+                    messagebox.showerror("Validation Error", "Base weight step must be between 0.05 and 1.0")
+                    return
+                if weight_step_cap < 1.0 or weight_step_cap > 5.0:
+                    messagebox.showerror("Validation Error", "Max step multiplier must be between 1.0 and 5.0")
+                    return
+                if weight_threshold_min >= weight_threshold_max:
+                    messagebox.showerror("Validation Error", "Min threshold multiplier must be less than max")
+                    return
+                if volatility_ewma < 0.5 or volatility_ewma > 0.99:
+                    messagebox.showerror("Validation Error", "Volatility smoothing must be between 0.5 and 0.99")
+                    return
+                if weight_decay_rate < 0.0 or weight_decay_rate > 0.1:
+                    messagebox.showerror("Validation Error", "Weight decay rate must be between 0.0 and 0.1")
+                    return
+                if age_pruning_percentile < 0.01 or age_pruning_percentile > 0.5:
+                    messagebox.showerror("Validation Error", "Age pruning percentile must be between 0.01 and 0.5")
+                    return
+                
+                # Read existing config to preserve timeframes and check for pattern_size change
                 existing_cfg = _safe_read_json(config_path) if os.path.isfile(config_path) else {}
                 timeframes = existing_cfg.get("timeframes", REQUIRED_THINKER_TIMEFRAMES)
+                old_pattern_size = existing_cfg.get("pattern_size", 3)
+                
+                # Warn if pattern_size changed (requires retraining)
+                if pattern_size != old_pattern_size:
+                    confirm = messagebox.askyesno(
+                        "Pattern Size Changed",
+                        f"Pattern size changed from {old_pattern_size} to {pattern_size} candles.\n\n"
+                        "This requires retraining ALL coins from scratch (existing patterns incompatible).\n\n"
+                        "Continue?",
+                        icon='warning'
+                    )
+                    if not confirm:
+                        return
                 
                 new_cfg = {
                     "staleness_days": staleness,
                     "auto_train_when_stale": bool(auto_train_var.get()),
-                    "bounce_accuracy_tolerance": accuracy_tolerance,
-                    "bounce_accuracy_target": accuracy_target,
-                    "min_pattern_weight": min_weight,
-                    "learning_rate": learning_rate,
-                    "initial_perfect_threshold": initial_threshold,
-                    "perfect_threshold_target": threshold_target,
-                    "target_matches_small": target_small,
-                    "target_matches_medium": target_medium,
-                    "target_matches_large": target_large,
-                    "timeframes": timeframes
+                    "pruning_sigma_level": pruning_sigma,
+                    "pid_kp": pid_kp,
+                    "pid_ki": pid_ki,
+                    "pid_kd": pid_kd,
+                    "pid_integral_limit": pid_limit,
+                    "min_threshold": min_threshold,
+                    "max_threshold": max_threshold,
+                    "pattern_size": pattern_size,
+                    "timeframes": timeframes,
+                    "weight_base_step": weight_base_step,
+                    "weight_step_cap_multiplier": weight_step_cap,
+                    "weight_threshold_base": weight_threshold_base,
+                    "weight_threshold_min": weight_threshold_min,
+                    "weight_threshold_max": weight_threshold_max,
+                    "volatility_ewma_decay": volatility_ewma,
+                    "weight_decay_rate": weight_decay_rate,
+                    "weight_decay_target": weight_decay_target,
+                    "age_pruning_enabled": bool(age_pruning_enabled_var.get()),
+                    "age_pruning_percentile": age_pruning_percentile,
+                    "age_pruning_weight_limit": age_pruning_weight
                 }
                 _safe_write_json(config_path, new_cfg)
                 messagebox.showinfo(
@@ -6918,15 +7317,25 @@ class ApolloHub(tk.Tk):
                 # Reset all fields to defaults
                 staleness_var.set(str(defaults.get("staleness_days", 14)))
                 auto_train_var.set(bool(defaults.get("auto_train_when_stale", False)))
-                target_small_var.set(str(defaults.get("target_matches_small", 10)))
-                target_medium_var.set(str(defaults.get("target_matches_medium", 15)))
-                target_large_var.set(str(defaults.get("target_matches_large", 20)))
-                accuracy_target_var.set(str(defaults.get("bounce_accuracy_target", 70.0)))
-                accuracy_tolerance_var.set(str(defaults.get("bounce_accuracy_tolerance", 0.5)))
-                learning_rate_var.set(str(defaults.get("learning_rate", 0.01)))
-                initial_threshold_var.set(str(defaults.get("initial_perfect_threshold", 1.0)))
-                threshold_target_var.set(str(defaults.get("perfect_threshold_target", 10.0)))
-                min_weight_var.set(str(defaults.get("min_pattern_weight", 0.1)))
+                pid_kp_var.set(str(defaults.get("pid_kp", 0.5)))
+                pid_ki_var.set(str(defaults.get("pid_ki", 0.01)))
+                pid_kd_var.set(str(defaults.get("pid_kd", 0.02)))
+                pid_limit_var.set(str(defaults.get("pid_integral_limit", 0.5)))
+                min_threshold_var.set(str(defaults.get("min_threshold", 1.0)))
+                max_threshold_var.set(str(defaults.get("max_threshold", 25.0)))
+                pruning_sigma_var.set(str(defaults.get("pruning_sigma_level", 2.0)))
+                pattern_size_var.set(str(defaults.get("pattern_size", 3)))
+                weight_base_step_var.set(str(defaults.get("weight_base_step", 0.25)))
+                weight_step_cap_var.set(str(defaults.get("weight_step_cap_multiplier", 2.0)))
+                weight_threshold_base_var.set(str(defaults.get("weight_threshold_base", 0.1)))
+                weight_threshold_min_var.set(str(defaults.get("weight_threshold_min", 0.03)))
+                weight_threshold_max_var.set(str(defaults.get("weight_threshold_max", 0.2)))
+                volatility_ewma_var.set(str(defaults.get("volatility_ewma_decay", 0.9)))
+                weight_decay_rate_var.set(str(defaults.get("weight_decay_rate", 0.001)))
+                weight_decay_target_var.set(str(defaults.get("weight_decay_target", 1.0)))
+                age_pruning_enabled_var.set(bool(defaults.get("age_pruning_enabled", True)))
+                age_pruning_percentile_var.set(str(defaults.get("age_pruning_percentile", 0.10)))
+                age_pruning_weight_var.set(str(defaults.get("age_pruning_weight_limit", 1.0)))
                 
                 # Save to file (includes resetting timeframes to required 7)
                 _safe_write_json(config_path, defaults)
@@ -6934,7 +7343,6 @@ class ApolloHub(tk.Tk):
                     "Reset",
                     "Training settings have been reset to defaults.\n\nStop and restart any active training for changes to take effect."
                 )
-                on_close()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to reset settings:\n{e}")
 

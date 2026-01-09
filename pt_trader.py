@@ -320,7 +320,7 @@ try:
     else:
         API_KEY = ""
 except Exception as e:
-    print(f"[PowerTrader] Error reading API key: {e}")
+    print(f"[ApolloTrader] Error reading API key: {e}")
     API_KEY = ""
 
 try:
@@ -330,12 +330,12 @@ try:
     else:
         BASE64_PRIVATE_KEY = ""
 except Exception as e:
-    print(f"[PowerTrader] Error reading private key: {e}")
+    print(f"[ApolloTrader] Error reading private key: {e}")
     BASE64_PRIVATE_KEY = ""
 
 if not API_KEY or not BASE64_PRIVATE_KEY:
     print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
+        "\n[ApolloTrader] Robinhood API credentials not found.\n"
         "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
         "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
         "and will save rh_key.enc + rh_secret.enc (encrypted) so this trader can authenticate.\n"
@@ -370,12 +370,13 @@ _trading_settings_cache = {
 			"target_with_dca_pct": 2.5
 		},
 		"entry_signals": {
-			"long_signal_min": 3,
+			"long_signal_min": 4,
 			"short_signal_max": 0
 		},
 		"position_sizing": {
 			"initial_allocation_pct": 0.005,
-			"min_allocation_usd": 0.5
+			"min_allocation_usd": 0.5,
+			"risk_multiplier": 0.5
 		},
 		"timing": {
 			"main_loop_delay_seconds": 0.5,
@@ -2044,7 +2045,8 @@ class CryptoAPITrading:
         trading_cfg = _load_trading_config()
         allocation_pct = trading_cfg.get("position_sizing", {}).get("initial_allocation_pct", 0.005)
         min_alloc = trading_cfg.get("position_sizing", {}).get("min_allocation_usd", 0.5)
-        allocation_in_usd = total_account_value * (allocation_pct / len(crypto_symbols))
+        risk_multiplier = trading_cfg.get("position_sizing", {}).get("risk_multiplier", 0.5)  # Fractional Kelly (research-optimized)
+        allocation_in_usd = total_account_value * (allocation_pct / len(crypto_symbols)) * risk_multiplier
         if allocation_in_usd < min_alloc:
             allocation_in_usd = min_alloc
 
@@ -2076,7 +2078,7 @@ class CryptoAPITrading:
 
             # Entry signal thresholds from config
             trading_cfg = _load_trading_config()
-            long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 3))))
+            long_min = max(1, min(7, int(trading_cfg.get("entry_signals", {}).get("long_signal_min", 4))))
             short_max = max(0, min(7, int(trading_cfg.get("entry_signals", {}).get("short_signal_max", 0))))
             
             if not (buy_count >= long_min and sell_count <= short_max):

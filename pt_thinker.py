@@ -105,8 +105,8 @@ def _decrypt_with_dpapi(encrypted_data: bytes) -> str:
 # Helper function to clean training file strings
 # -----------------------------
 def _clean_training_string(text: str) -> str:
-	"""Remove quotes, brackets, commas, and spaces from training file data."""
-	for char in ("'", ',', '"', ']', '[', ' '):
+	"""Remove quotes, brackets, commas from training file data."""
+	for char in ("'", ',', '"', ']', '['):
 		text = text.replace(char, '')
 	return text
 
@@ -978,7 +978,7 @@ def step_coin(sym: str):
 					continue
 				
 				try:
-					memory_pattern = _clean_training_string(parts[0]).split()
+					memory_pattern = _clean_training_string(parts[0]).split('|')
 					if not memory_pattern:
 						# Empty pattern after cleaning - skip
 						mem_ind += 1

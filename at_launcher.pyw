@@ -124,13 +124,7 @@ def check_and_install_requirements():
         print("\n" + "="*60)
         print("Apollo Trader - First Time Setup")
         print("="*60)
-        print(r"""
-    ▀█▀ █▀█   ▀█▀ █ █ █▀▀   █▀▄▀█ █▀█ █▀█ █▄ █ █
-     █  █ █    █  █▀█ ██▄   █ ▀ █ █▄█ █▄█ █ ▀█ ▄
-                       
-        🚀  Crypto Trading AI  🚀
-        """)
-        print("Installing required packages:")
+        print("\nInstalling required packages:")
         for pkg in missing_packages:
             print(f"  • {pkg}")
         print("\nThis may take a few moments...\n")
@@ -310,6 +304,14 @@ except Exception as e:
 if __name__ == "__main__":
     lock_file = os.path.join(script_dir, ".apollo.lock")
     try:
+        # Display launch message (last thing before GUI appears)
+        print(r"""
+    ▀█▀ █▀█   ▀█▀ █ █ █▀▀   █▀▄▀█ █▀█ █▀█ █▄ █ █
+     █  █ █    █  █▀█ ██▄   █ ▀ █ █▄█ █▄█ █ ▀█ ▄
+                       
+        🚀  Crypto Trading AI  🚀
+        """)
+        
         app = pt_hub.ApolloHub()
         app.mainloop()
     except Exception as e:

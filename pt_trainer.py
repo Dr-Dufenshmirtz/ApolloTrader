@@ -45,6 +45,7 @@ import hmac
 import json
 import uuid
 import logging
+import math
 
 # Ensure clean console output
 try:
@@ -133,6 +134,14 @@ def vprint(*args, **kwargs):
 _memory_cache = {}  # tf_choice -> dict(memory_list, weight_list, high_weight_list, low_weight_list, dirty)
 _last_threshold_written = {}  # tf_choice -> float
 
+# EWMA volatility tracking for volatility-adaptive thresholds
+# Maintains running average of market volatility to scale error thresholds dynamically
+_volatility_cache = {}  # tf_choice -> {"ewma_volatility": float, "avg_volatility": float}
+
+# Pattern age tracking for adaptive pruning
+# Tracks validation count per pattern to enable removal of stale low-weight patterns
+_pattern_ages = {}  # tf_choice -> [age_count_per_pattern]
+
 # Global write buffer to reduce disk I/O during training
 # Thresholds are buffered and written only at critical points (timeframe end, training complete, user stop)
 _write_buffer = {
@@ -140,6 +149,32 @@ _write_buffer = {
 	"last_checkpoint_time": 0,  # timestamp of last safety checkpoint
 	"last_flush_time": 0,       # timestamp of last periodic flush
 }
+
+# PID controller state tracking per timeframe
+_pid_state = {}  # tf_choice -> dict(integral_error, prev_error, initialized)
+
+def init_pid_state(tf_choice):
+	"""Initialize PID state for a timeframe."""
+	if tf_choice not in _pid_state:
+		_pid_state[tf_choice] = {
+			"integral_error": 0.0,    # Accumulated error for Ki term
+			"prev_error": 0.0,         # Previous error for Kd term
+			"initialized": False       # First iteration flag
+		}
+
+def reset_pid_state(tf_choice):
+	"""Reset PID state (e.g., after retraining or when starting fresh)."""
+	if tf_choice in _pid_state:
+		_pid_state[tf_choice] = {
+			"integral_error": 0.0,
+			"prev_error": 0.0,
+			"initialized": False
+		}
+
+def get_pid_state(tf_choice):
+	"""Get PID state for timeframe, initializing if needed."""
+	init_pid_state(tf_choice)
+	return _pid_state[tf_choice]
 
 def _read_text(path):
 	with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -160,7 +195,7 @@ def load_memory(tf_choice):
 	try:
 		data["memory_list"] = _read_text(f"memories_{tf_choice}.dat").replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split('~')
 		# Pre-split patterns once during load (huge speedup for pattern matching)
-		data["memory_patterns"] = [mem.split('{}')[0].split(' ') for mem in data["memory_list"]]
+		data["memory_patterns"] = [mem.split('{}')[0].split('|') for mem in data["memory_list"]]
 	except:
 		data["memory_list"] = []
 		data["memory_patterns"] = []
@@ -180,6 +215,11 @@ def load_memory(tf_choice):
 	except:
 		data["low_weight_list"] = []
 	_memory_cache[tf_choice] = data
+	
+	# Initialize age tracking for each pattern (starts at 0 for all existing patterns)
+	if tf_choice not in _pattern_ages:
+		_pattern_ages[tf_choice] = [0] * len(data["memory_list"])
+	
 	return data
 
 def flush_memory(tf_choice, force=False):
@@ -267,7 +307,7 @@ def clear_incompatible_patterns(tf_choice, expected_pattern_size):
 		
 		first_pattern = content.split('~')[0]
 		if '{}' in first_pattern:
-			pattern_values = first_pattern.split('{}')[0].split(' ')
+			pattern_values = first_pattern.split('{}')[0].split('|')
 			pattern_values = [v for v in pattern_values if v.strip() != '']
 			actual_size = len(pattern_values)
 			expected_size = expected_pattern_size - 1  # number_of_candles=3 means 2 prior values
@@ -558,27 +598,67 @@ else:
 tf_minutes = [tf_minutes_map.get(tf, 60) for tf in tf_choices]
 
 # Load training parameter settings with defaults
-bounce_accuracy_tolerance = training_settings.get("bounce_accuracy_tolerance", 0.5) if os.path.isfile(import_path) else 0.5
-bounce_accuracy_target = training_settings.get("bounce_accuracy_target", 70.0) if os.path.isfile(import_path) else 70.0
-min_pattern_weight = training_settings.get("min_pattern_weight", 0.1) if os.path.isfile(import_path) else 0.1
-base_learning_rate = training_settings.get("learning_rate", 0.01) if os.path.isfile(import_path) else 0.01
-initial_perfect_threshold = training_settings.get("initial_perfect_threshold", 1.0) if os.path.isfile(import_path) else 1.0
-perfect_threshold_target = training_settings.get("perfect_threshold_target", 10.0) if os.path.isfile(import_path) else 10.0
-target_matches_small = training_settings.get("target_matches_small", 10) if os.path.isfile(import_path) else 10
-target_matches_medium = training_settings.get("target_matches_medium", 15) if os.path.isfile(import_path) else 15
-target_matches_large = training_settings.get("target_matches_large", 20) if os.path.isfile(import_path) else 20
+pruning_sigma_level = training_settings.get("pruning_sigma_level", 2.0) if os.path.isfile(import_path) else 2.0
+min_threshold = training_settings.get("min_threshold", 1.0) if os.path.isfile(import_path) else 1.0
+max_threshold = training_settings.get("max_threshold", 25.0) if os.path.isfile(import_path) else 25.0
+pattern_size = training_settings.get("pattern_size", 3) if os.path.isfile(import_path) else 3
 
-# Initialize number_of_candles based on number of timeframes being trained
-# Each timeframe starts with minimum pattern size (2 candles = 1 prior value, 3 candles = 2 prior values)
-number_of_candles = [2] * len(tf_choices)
+# PID controller parameters (tuned for non-stationary crypto markets)
+# Kp: proportional gain for quick response to current error
+# Ki: integral gain for eliminating steady-state error (reduced to prevent windup)
+# Kd: derivative gain for anticipating volatility changes and damping oscillations
+pid_kp = training_settings.get("pid_kp", 0.5) if os.path.isfile(import_path) else 0.5
+pid_ki = training_settings.get("pid_ki", 0.005) if os.path.isfile(import_path) else 0.005
+pid_kd = training_settings.get("pid_kd", 0.2) if os.path.isfile(import_path) else 0.2
+pid_integral_limit = training_settings.get("pid_integral_limit", 20) if os.path.isfile(import_path) else 20
+
+# Weight adjustment parameters (error-proportional scaling)
+# Base step scales with error magnitude for faster convergence on large errors
+weight_base_step = training_settings.get("weight_base_step", 0.25) if os.path.isfile(import_path) else 0.25
+weight_step_cap = training_settings.get("weight_step_cap_multiplier", 2.0) if os.path.isfile(import_path) else 2.0
+
+# Volatility-adaptive threshold parameters
+# Thresholds scale with market conditions: tight in calm markets, loose in volatile markets
+# Also scale with pattern weight: stricter for high-confidence patterns
+weight_threshold_base = training_settings.get("weight_threshold_base", 0.1) if os.path.isfile(import_path) else 0.1
+weight_threshold_min = training_settings.get("weight_threshold_min", 0.03) if os.path.isfile(import_path) else 0.03
+weight_threshold_max = training_settings.get("weight_threshold_max", 0.2) if os.path.isfile(import_path) else 0.2
+volatility_ewma_decay = training_settings.get("volatility_ewma_decay", 0.9) if os.path.isfile(import_path) else 0.9
+
+# Temporal decay parameters
+# Weights decay toward baseline to prevent saturation and adapt to market regime changes
+# Formula: weight = weight × (1 - decay_rate) + target × decay_rate
+weight_decay_rate = training_settings.get("weight_decay_rate", 0.001) if os.path.isfile(import_path) else 0.001
+weight_decay_target = training_settings.get("weight_decay_target", 1.0) if os.path.isfile(import_path) else 1.0
+
+# Age-based pruning parameters
+# Remove oldest N% of patterns with low weights to prevent stale pattern accumulation
+age_pruning_enabled = training_settings.get("age_pruning_enabled", True) if os.path.isfile(import_path) else True
+age_pruning_percentile = training_settings.get("age_pruning_percentile", 0.10) if os.path.isfile(import_path) else 0.10
+age_pruning_weight_limit = training_settings.get("age_pruning_weight_limit", 1.0) if os.path.isfile(import_path) else 1.0
+
+# Calculate initial and target threshold as average of min and max
+initial_perfect_threshold = (min_threshold + max_threshold) / 2
+perfect_threshold_target = (min_threshold + max_threshold) / 2
+# bounce_accuracy_tolerance is hardcoded (not a training parameter, used only for post-training measurement)
+bounce_accuracy_tolerance = 0.1  # Measures prediction quality at 0.1% inside the trading trigger zone
+
+# Initialize number_of_candles based on pattern_size setting
+# pattern_size=3 means 3 candles (2 prior values + current), pattern_size=2 means 2 candles (1 prior + current)
+number_of_candles = [pattern_size] * len(tf_choices)
 
 # Debug print to confirm settings are loaded (will only show if debug mode is enabled)
 try:
 	debug_print(f"[DEBUG] TRAINER: Loaded training settings from: {import_path}")
 	debug_print(f"[DEBUG] TRAINER: Active timeframes: {tf_choices}")
 	debug_print(f"[DEBUG] TRAINER: Pattern sizes (number_of_candles): {number_of_candles}")
-	debug_print(f"[DEBUG] TRAINER: Training parameters - bounce_tol={bounce_accuracy_tolerance}, bounce_target={bounce_accuracy_target}, min_weight={min_pattern_weight}, learning_rate={base_learning_rate}, threshold_target={perfect_threshold_target}")
-	debug_print(f"[DEBUG] TRAINER: Target matches - small={target_matches_small}, medium={target_matches_medium}, large={target_matches_large}")
+	debug_print(f"[DEBUG] TRAINER: Training parameters - bounce_tol={bounce_accuracy_tolerance}, pruning_sigma={pruning_sigma_level}")
+	debug_print(f"[DEBUG] TRAINER: Threshold limits - min={min_threshold}%, max={max_threshold}%, initial/target={initial_perfect_threshold}%")
+	debug_print(f"[DEBUG] TRAINER: PID Controller - Kp={pid_kp}, Ki={pid_ki}, Kd={pid_kd}, integral_limit={pid_integral_limit}")
+	debug_print(f"[DEBUG] TRAINER: Weight adjustment - base_step={weight_base_step}, cap={weight_step_cap}x (error-proportional scaling)")
+	debug_print(f"[DEBUG] TRAINER: Adaptive thresholds - base={weight_threshold_base}, range=[{weight_threshold_min}, {weight_threshold_max}], ewma_decay={volatility_ewma_decay}")
+	debug_print(f"[DEBUG] TRAINER: Temporal decay - rate={weight_decay_rate}, target={weight_decay_target} (half-life ~{int(0.693/weight_decay_rate)} validations)")
+	debug_print(f"[DEBUG] TRAINER: Age pruning - enabled={age_pruning_enabled}, percentile={age_pruning_percentile}, weight_limit={age_pruning_weight_limit}")
 except:
 	pass
 # GUI hub input (no prompts)
@@ -691,7 +771,11 @@ bounce_accuracy_dict = {}  # Store bounce accuracy for each timeframe
 # then performs training/analysis for the configured `tf_choice`. It is
 # designed to be long-running and guarded by small I/O checkpoints so
 # external 'killer' files, status files, or restarts can be coordinated.
-while True:
+while True:	
+	# Safety check: exit if all timeframes processed
+	if the_big_index >= len(tf_choices):
+		print("All timeframes completed. Exiting.")
+		sys.exit(0)
 	debug_print(f"[DEBUG] TRAINER: Outer loop restart - the_big_index={the_big_index}")
 	# tf_choice is set inside the loop, so we'll add debug at the point where it's known
 	_restart_outer_loop = False  # Flag to break out of nested loops
@@ -946,6 +1030,18 @@ while True:
 			mark_training_error(f"No historical data for {timeframe}")
 			sys.exit(1)
 		
+		# Validate we have minimum data to train (need at least 12 candles for meaningful patterns)
+		if len(price_list) < 12:
+			print(f"WARNING: Insufficient data for {_arg_coin} on {timeframe} timeframe ({len(price_list)} candles, minimum 12 required).")
+			print(f"         Skipping this timeframe and continuing to next...")
+			the_big_index += 1
+			if the_big_index < len(tf_choices):
+				_restart_outer_loop = True
+				break  # Skip to next timeframe
+			else:
+				print(f"All timeframes processed (some skipped due to insufficient data).")
+				sys.exit(0)
+		
 		ticker_data = str(market.get_ticker(coin_choice)).replace('"','').replace("'","").replace("[","").replace("{","").replace("]","").replace("}","").replace(",","").lower().split(' ')
 		price = float(ticker_data[ticker_data.index('price:')+1])
 	except:
@@ -959,10 +1055,38 @@ while True:
 	history_list = []
 	history_list2 = []
 	perfect_threshold = initial_perfect_threshold
+	
+	# Try to load previously saved threshold to resume from last training
+	# Threshold is relative percentage of pattern average (e.g., 10 = patterns differ by 10% of avg)
+	try:
+		threshold_file = f"neural_perfect_threshold_{tf_choice}.dat"
+		if os.path.exists(threshold_file):
+			with open(threshold_file, "r") as f:
+				saved_threshold = float(f.read().strip())
+				if min_threshold <= saved_threshold <= max_threshold:  # Validate range (relative percentage)
+					perfect_threshold = saved_threshold
+					debug_print(f"[DEBUG] TRAINER: Loaded saved threshold: {perfect_threshold:.4f}")
+				else:
+					debug_print(f"[DEBUG] TRAINER: Saved threshold {saved_threshold:.4f} out of range, using initial")
+		else:
+			debug_print(f"[DEBUG] TRAINER: No saved threshold found, starting at {perfect_threshold:.4f}")
+	except Exception as e:
+		debug_print(f"[DEBUG] TRAINER: Failed to load saved threshold: {e}, using initial")
+	
+	# Initialize PID state for this timeframe
+	init_pid_state(tf_choice)
+	debug_print(f"[DEBUG] TRAINER: Initialized PID state for {tf_choice}")
+	
 	loop_i = 0  # counts inner training iterations (used to throttle disk IO)
-	# Start with 1 candle and grow 1 at a time for maximum learning and self-correction
-	price_list_length = 1
+	
+	# Skip first 2% of candles to avoid volatile startup period (minimum 12)
+	# Crypto data often has extreme volatility in first 1-2% of historical data
+	# This prevents poor-quality patterns from contaminating the training set
+	initial_skip = max(12, int(len(price_list) * 0.02))
+	price_list_length = initial_skip + 1
 	last_printed_candle = 0  # Track last candle we printed status for
+	last_printed_accuracy = None  # Track accuracy at last print for trend arrows
+	debug_print(f"[DEBUG] TRAINER: Skipping first {initial_skip} candles (2% of {len(price_list)} with min 12) to avoid volatile startup period")
 	debug_print(f"[DEBUG] TRAINER: Starting window size: {price_list_length} candles (total: {len(price_list)})")
 	
 	# Initialize price change lists - will be built incrementally one candle at a time (O(n) instead of O(n²))
@@ -1000,21 +1124,33 @@ while True:
 			while len(price_list2) > len(price_change_list):
 				new_index = len(price_change_list)
 				if new_index < len(price_list2) and new_index < len(open_price_list2):
-					price_change = 100*((price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					# Protect against division by zero (corrupted data with zero open price)
+					if open_price_list2[new_index] != 0:
+						price_change = 100*((price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					else:
+						price_change = 0.0
 					price_change_list.append(price_change)
 					debug_print(f"[DEBUG] TRAINER: Added price_change[{new_index}] = {price_change:.4f}")
 			
 			while len(high_price_list2) > len(high_price_change_list):
 				new_index = len(high_price_change_list)
 				if new_index < len(high_price_list2) and new_index < len(open_price_list2):
-					high_price_change = 100*((high_price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					# Protect against division by zero (corrupted data with zero open price)
+					if open_price_list2[new_index] != 0:
+						high_price_change = 100*((high_price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					else:
+						high_price_change = 0.0
 					high_price_change_list.append(high_price_change)
 					debug_print(f"[DEBUG] TRAINER: Added high_price_change[{new_index}] = {high_price_change:.4f}")
 			
 			while len(low_price_list2) > len(low_price_change_list):
 				new_index = len(low_price_change_list)
 				if new_index < len(low_price_list2) and new_index < len(open_price_list2):
-					low_price_change = 100*((low_price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					# Protect against division by zero (corrupted data with zero open price)
+					if open_price_list2[new_index] != 0:
+						low_price_change = 100*((low_price_list2[new_index]-open_price_list2[new_index])/open_price_list2[new_index])
+					else:
+						low_price_change = 0.0
 					low_price_change_list.append(low_price_change)
 					debug_print(f"[DEBUG] TRAINER: Added low_price_change[{new_index}] = {low_price_change:.4f}")
 			
@@ -1190,7 +1326,9 @@ while True:
 								for check_dex in range(min_len):
 									current_candle = float(current_pattern[check_dex])
 									memory_candle = float(memory_pattern[check_dex])
-									# Calculate difference with explicit zero-division protection
+									# Calculate RELATIVE difference: percentage of average (not absolute)
+									# Example: 2.0% vs 2.2% → avg=2.1, diff=|2.0-2.2|/2.1*100 = 9.52%
+									# threshold=10 means patterns can differ by 10% of their average value
 									avg_value = (current_candle + memory_candle) / 2
 									if avg_value == 0.0:
 										# Both values are zero or sum to zero - no difference
@@ -1288,67 +1426,119 @@ while True:
 					else:
 						current_accuracy = 0.0
 					
-					# Target matches: scale with pattern count
-					# Small library (<5k): target 10 matches
-					# Medium library (5k-50k): target medium matches  
-					# Large library (>50k): target large matches
-					if pattern_count < 5000:
-						target_matches = target_matches_small
-					elif pattern_count < 50000:
-						target_matches = target_matches_medium
+					# Calculate recent volatility for adaptive parameters
+					# Use RMS (root mean square) of recent price changes as volatility measure
+					# Used for adaptive threshold bounds and volatility-adaptive k-selection
+					volatility_window = min(500, max(10, int(len(price_change_list) * 0.1)))
+					if len(price_change_list) >= volatility_window:
+						recent_changes = price_change_list[-volatility_window:]
+						# RMS volatility: sqrt(mean(squared_changes))
+						avg_volatility = math.sqrt(sum(x**2 for x in recent_changes) / len(recent_changes))
 					else:
-						target_matches = target_matches_large
+						# Fallback for early training: use all available data
+						if len(price_change_list) > 0:
+							avg_volatility = math.sqrt(sum(x**2 for x in price_change_list) / len(price_change_list))
+						else:
+							avg_volatility = 2.0  # Default fallback (typical crypto volatility)
 					
-					# MATHEMATICAL threshold adjustment (continuous feedback loop)
-					# All multipliers are continuous functions, no discrete tiers
+					debug_print(f"[DEBUG] TRAINER: Calculated avg_volatility={avg_volatility:.3f}% (window={volatility_window})")
 					
-					# Dataset size: smaller datasets need faster convergence
+					# Initialize volatility cache for adaptive thresholds
+					if tf_choice not in _volatility_cache:
+						_volatility_cache[tf_choice] = {
+							"ewma_volatility": avg_volatility,
+							"avg_volatility": avg_volatility
+						}
+						debug_print(f"[DEBUG] TRAINER: Initialized volatility cache - ewma={avg_volatility:.3f}%, avg={avg_volatility:.3f}%")
+					
+					# Adaptive threshold bounds based on market volatility
+					# Low volatility → tighter bounds (more precise matching)
+					# High volatility → wider bounds (accommodate market noise)
+					# Formula: min = max(1.0, 0.5×volatility), max = min(50.0, 2.0×volatility)
+					adaptive_min_threshold = max(1.0, 0.5 * avg_volatility)
+					adaptive_max_threshold = min(50.0, 2.0 * avg_volatility)
+					debug_print(f"[DEBUG] TRAINER: Adaptive bounds = [{adaptive_min_threshold:.2f}, {adaptive_max_threshold:.2f}] (volatility-scaled)")
+					
+					# Volatility-adaptive k-selection using √N formula
+					# Formula: k = int(√N × volatility_factor)
+					# Rationale: √N has better theoretical foundation (kNN literature)
+					#            Volatility factor adapts to market conditions
+					#            Scales properly: small N → small k, large N → larger k
 					dataset_size = len(price_list)
-					if dataset_size < 2000:
-						size_multiplier = 2.0  # Fast convergence for small datasets
-					elif dataset_size < 5000:
-						size_multiplier = 1.5  # Medium convergence
+					if dataset_size >= 2:
+						# Normalize volatility to 0.1-1.0 range for scaling factor
+						volatility_factor = max(0.1, min(1.0, avg_volatility / 10.0))
+						dynamic_k = int(math.sqrt(dataset_size) * volatility_factor)
+						dynamic_k = max(3, dynamic_k)  # Minimum k=3 for statistical validity
+						
+						debug_print(f"[DEBUG] TRAINER: Dynamic k = {dynamic_k} (√N formula, volatility_factor={volatility_factor:.3f}, N={dataset_size})")
 					else:
-						size_multiplier = 1.0  # Standard convergence
+						dynamic_k = 3  # Fallback minimum for statistical validity
+						debug_print(f"[DEBUG] TRAINER: Using fallback k = 3 (dataset_size={dataset_size} too small)")
 					
-					# Bounce accuracy feedback: quality_multiplier = target / actual
-					# Low accuracy (50%) → target/50 = 1.4× (aggressive)
-					# At target → target/target = 1.0× (neutral)
-					# High accuracy (85%) → target/85 = 0.82× (gentle)
-					target_bounce_accuracy = bounce_accuracy_target
-					bounce_accuracy = bounce_accuracy_dict.get(tf_choice, 0.0)
-					if bounce_accuracy > 0:
-						quality_multiplier = target_bounce_accuracy / max(10.0, bounce_accuracy)
-						quality_multiplier = max(0.3, min(2.0, quality_multiplier))  # Clamp to sane range
+					# Adaptive target percentage based on pattern complexity
+					# Formula: 0.01 × sqrt(pattern_size)
+					# Rationale: Larger patterns have more information content, need higher coverage
+					# Examples: pattern_size=2 → 1.41%, pattern_size=3 → 1.73%, pattern_size=5 → 2.24%
+					target_percentage = 0.01 * math.sqrt(pattern_size)
+					debug_print(f"[DEBUG] TRAINER: Adaptive target_percentage = {target_percentage*100:.2f}% (pattern_size={pattern_size})")
+					
+					# Target matches: min of adaptive % of dataset or dynamic k
+					target_matches = min(int(dataset_size * target_percentage), dynamic_k)
+					# Ensure at least 1 match is required
+					if target_matches < 1:
+						target_matches = 1
+					
+					# THRESHOLD ADJUSTMENT using PID controller
+					# Normalized error: (target - actual) / target
+					# Positive error = too few matches → increase threshold (looser matching)
+					# Negative error = too many matches → decrease threshold (stricter matching)
+					# HIGHER threshold = looser = MORE pattern matches
+					# LOWER threshold = stricter = FEWER pattern matches
+					assert target_matches > 0, f"target_matches must be positive, got {target_matches}"
+					error = (target_matches - match_count) / target_matches
+					
+					# PID Controller - Pure adaptive feedback
+					# No manual heuristics: no size_multiplier, no quality_multiplier, no deadlock override
+					pid_state = get_pid_state(tf_choice)
+					
+					# Proportional term (responds to current error)
+					p_term = pid_kp * error
+					
+					# Integral term (eliminates steady-state error, prevents deadlock)
+					pid_state["integral_error"] += error
+					# Anti-windup: Clamp integral to prevent runaway accumulation
+					pid_state["integral_error"] = max(-pid_integral_limit, min(pid_integral_limit, pid_state["integral_error"]))
+					i_term = pid_ki * pid_state["integral_error"]
+					
+					# Derivative term (dampens oscillations, prevents overshoot)
+					if pid_state["initialized"]:
+						d_term = pid_kd * (error - pid_state["prev_error"])
 					else:
-						quality_multiplier = 1.0  # No data yet, neutral
+						d_term = 0.0  # First iteration, no previous error
+						pid_state["initialized"] = True
 					
-					# Match error: encodes both magnitude and direction
-					# Too many matches (15 vs 10) → (10-15)/10 = -0.5 → decrease threshold
-					# Too few matches (5 vs 10) → (10-5)/10 = +0.5 → increase threshold
-					# At target (10 vs 10) → 0 → no change
-					match_ratio = (target_matches - match_count) / target_matches
+					# Update previous error for next iteration
+					pid_state["prev_error"] = error
 					
-					# Learning rate: very conservative since this runs every candle (1497 iterations)
-					# When close to target, divide by 10 for fine-tuning
-					if perfect_threshold < perfect_threshold_target:
-						learning_rate = base_learning_rate / 10
-					else:
-						learning_rate = base_learning_rate
+					# PID output (clean - no multipliers!)
+					adjustment = p_term + i_term + d_term
 					
-					# Final adjustment: learning_rate × match_error × multipliers
-					adjustment = learning_rate * match_ratio * size_multiplier * quality_multiplier
-					
-					# Accuracy-aware damping: reduce increases when accuracy is already excellent
-					if adjustment > 0 and current_accuracy >= 90.0 and match_count >= 5:
-						adjustment *= 0.05  # 95% reduction for excellent accuracy
+					debug_print(f"[DEBUG] TRAINER: PID adjustment={adjustment:.4f} | P={p_term:.4f}, I={i_term:.4f} (Σ={pid_state['integral_error']:.3f}), D={d_term:.4f} | error={error:.3f}")
 					
 					perfect_threshold += adjustment
 					
-					# Clamp between 0.01 (prevent negative/zero) and 0.90 (prevent runaway)
-					perfect_threshold = max(0.01, min(90, perfect_threshold))
+					# Clamp threshold with adaptive bounds (volatility-scaled)
+					# Adaptive bounds adjust to market conditions while respecting configured limits
+					# Effective bounds are the stricter of volatility-based or user-configured values
+					effective_min = max(min_threshold, adaptive_min_threshold)
+					effective_max = min(max_threshold, adaptive_max_threshold)
+					perfect_threshold = max(effective_min, min(effective_max, perfect_threshold))
 					
-					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.4f} | matches={match_count}/{target_matches} | match_acc={current_accuracy:.1f}% | bounce_acc={bounce_accuracy:.1f}% (×{quality_multiplier:.1f}) | patterns={pattern_count:,}")
+					# Status output
+					pid_state = get_pid_state(tf_choice)
+					bounce_accuracy = bounce_accuracy_dict.get(tf_choice, 0.0)
+					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.4f} | matches={match_count}/{target_matches} (target={target_percentage*100:.2f}%) | PID_Σ={pid_state['integral_error']:.3f} | match_acc={current_accuracy:.1f}% | bounce_acc={bounce_accuracy:.1f}% | patterns={pattern_count:,}")
 					
 					# Buffer threshold in memory instead of writing to disk
 					buffer_threshold(tf_choice, perfect_threshold)
@@ -1481,7 +1671,7 @@ while True:
 							else:
 								high_new_y = [0.0, 0.0]
 							if len(low_current_pattern) > 0:
-								low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_currentPattern)-1]]
+								low_new_y = [current_pattern[len(current_pattern)-1] if len(current_pattern) > 0 else 0.0, low_current_pattern[len(low_current_pattern)-1]]
 							else:
 								low_new_y = [0.0, 0.0]
 					else:
@@ -1602,39 +1792,23 @@ while True:
 									upordown3.append(1)
 									upordown.append(1)
 									upordown4.append(1)
-									if len(upordown4) > 100:
-										del upordown4[0]
-									else:
-										pass
 								# Case 2: Low limit approached, close bounced back (SUCCESS)
 								elif low_percent_difference_of_actuals <= low_baseline_price_change_pct - tolerance and percent_difference_of_actuals > low_baseline_price_change_pct:
 									upordown.append(1)
 									upordown3.append(1)
 									upordown4.append(1)
-									if len(upordown4) > 100:
-										del upordown4[0]
-									else:
-										pass
 								# Case 3: High limit approached, close broke through (FAILURE)
 								elif high_percent_difference_of_actuals >= high_baseline_price_change_pct + tolerance and percent_difference_of_actuals > high_baseline_price_change_pct:
 									upordown3.append(0)
 									upordown2.append(0)
 									upordown.append(0)
 									upordown4.append(0)
-									if len(upordown4) > 100:
-										del upordown4[0]
-									else:
-										pass
 								# Case 4: Low limit approached, close broke through (FAILURE)
 								elif low_percent_difference_of_actuals <= low_baseline_price_change_pct - tolerance and percent_difference_of_actuals < low_baseline_price_change_pct:
 									upordown3.append(0)
 									upordown2.append(0)
 									upordown.append(0)
 									upordown4.append(0)
-									if len(upordown4) > 100:
-										del upordown4[0]
-									else:
-										pass
 								else:
 									# Price stayed within normal range - not tracked for bounce accuracy
 									pass
@@ -1643,6 +1817,7 @@ while True:
 							# Calculate and display bounce accuracy if we have data
 							if len(upordown4) > 0:
 								accuracy = (sum(upordown4)/len(upordown4))*100
+								
 								# Store accuracy in dict for this timeframe
 								bounce_accuracy_dict[tf_choice] = accuracy
 								
@@ -1653,13 +1828,40 @@ while True:
 								
 								# Print if this is a new milestone we haven't printed yet
 								if current_candle != last_printed_candle and (current_candle % print_interval == 0 or current_candle == total_candles):
+									# Calculate adaptive threshold from statistical standard error
+									# Formula: SE = sqrt(p×(1-p)/n) where p=accuracy proportion, n=sample count
+									# Threshold = 2×SE (95% confidence interval) to filter statistical noise
+									sample_count = len(upordown4)
+									if sample_count > 0:
+										p = accuracy / 100  # Convert to proportion (0-1)
+										standard_error = math.sqrt(p * (1 - p) / sample_count) * 100  # Back to percentage points
+										adaptive_threshold = 2.0 * standard_error  # 95% CI
+										# Clamp between 0.05 and 0.5 to prevent extremes
+										adaptive_threshold = max(0.05, min(0.5, adaptive_threshold))
+									else:
+										adaptive_threshold = 0.5  # Default for no data
+									
+									# Determine trend arrow by comparing to last PRINTED accuracy (not last candle)
+									if last_printed_accuracy is None:
+										trend_arrow = "*"  # First print, starting point
+									elif accuracy > last_printed_accuracy + adaptive_threshold:
+										trend_arrow = "^"
+									elif accuracy < last_printed_accuracy - adaptive_threshold:
+										trend_arrow = "v"
+									else:
+										trend_arrow = "="  # No significant change
+									
 									formatted = format(accuracy, '.2f').rstrip('0').rstrip('.')
 									limit_test_count = len(upordown4)
-									print(f'Accuracy (last 100 breakout candles): {formatted}%')
+									limit_test_count_formatted = f'{limit_test_count:,}'
+									print(f'Bounce Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} breakout candles)')
 									threshold_formatted = format(perfect_threshold, '.2f')
-									print(f'Candles Processed: {current_candle} ({threshold_formatted}% threshold)')
+									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold)')
 									acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
-									print(f'Total Candles: {total_candles} ({acceptance_formatted}% acceptance)')
+									print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
+									
+									# Update last printed accuracy for next comparison
+									last_printed_accuracy = accuracy
 						except:
 							PrintException()
 					else:
@@ -1732,42 +1934,114 @@ while True:
 									# Check if we've processed all candles for this timeframe
 									if len(price_list2) == len(price_list):
 										# OPTIMIZATION: Prune weak patterns before saving (keeps files lean)
-										# Remove patterns with weight below threshold (they contribute almost nothing to predictions)
-										debug_print(f"[DEBUG] TRAINER: Pruning weak patterns (weight < {min_pattern_weight}) for {tf_choice}")
+										# Sigma-based adaptive pruning: removes patterns with weight < (mean - sigma × std_dev)
+										# This adaptively removes only true outliers, not fixed threshold (more robust)
+										debug_print(f"[DEBUG] TRAINER: Pruning weak patterns (sigma-based, level={pruning_sigma_level}) for {tf_choice}")
 										try:
 											_mem = _memory_cache.get(tf_choice)
 											if _mem:
 												original_count = len(_mem["memory_list"])
-												# Filter all lists together using zip (faster and cleaner)
-												filtered = []
-												for mem, w, hw, lw in zip(_mem["memory_list"], _mem["weight_list"], 
-												                          _mem["high_weight_list"], _mem["low_weight_list"]):
+												
+												# Calculate mean and std dev of weights for sigma-based pruning
+												valid_weights = []
+												for w in _mem["weight_list"]:
 													try:
-														if float(w) >= min_pattern_weight:
-															filtered.append((mem, w, hw, lw))
+														valid_weights.append(float(w))
+													except (ValueError, TypeError):
+														pass
+												
+												if len(valid_weights) > 1:
+													try:
+														import statistics
+														mean_weight = statistics.mean(valid_weights)
+														stdev_weight = statistics.stdev(valid_weights)
+														pruning_threshold = mean_weight - (pruning_sigma_level * stdev_weight)
+														
+														# Validate that the threshold is a valid number
+														if not isinstance(pruning_threshold, (int, float)) or pruning_threshold != pruning_threshold:  # NaN check
+															pruning_threshold = -float('inf')
+															debug_print(f"[DEBUG] TRAINER: Invalid pruning threshold calculated, keeping all patterns")
+														else:
+															debug_print(f"[DEBUG] TRAINER: Weight stats - mean={mean_weight:.4f}, stdev={stdev_weight:.4f}, threshold={pruning_threshold:.4f}")
+													except Exception as stats_err:
+														# Statistics calculation failed, keep all patterns
+														pruning_threshold = -float('inf')
+														debug_print(f"[DEBUG] TRAINER: Stats calculation failed ({stats_err}), keeping all patterns")
+												else:
+													# Not enough data for statistics, keep all patterns
+													pruning_threshold = -float('inf')
+													debug_print(f"[DEBUG] TRAINER: Not enough patterns for sigma pruning, keeping all")
+												
+												# Get ages for this timeframe (use empty list if not initialized)
+												ages = _pattern_ages.get(tf_choice, [])
+												# Pad ages list if shorter than memory (safety for edge cases)
+												while len(ages) < len(_mem["memory_list"]):
+													ages.append(0)
+												
+												# Filter all lists together using zip (faster and cleaner)
+												# Include ages in the zip to keep everything synchronized
+												filtered = []
+												for mem, w, hw, lw, age in zip(_mem["memory_list"], _mem["weight_list"], 
+												                               _mem["high_weight_list"], _mem["low_weight_list"], ages):
+													try:
+														if float(w) >= pruning_threshold:
+															filtered.append((mem, w, hw, lw, age))
 													except (ValueError, TypeError):
 														pass  # Skip corrupt weight entries
 												
-												# Unzip filtered results and rebuild memory_patterns
+												sigma_pruned = original_count - len(filtered)
+												debug_print(f"[DEBUG] TRAINER: Sigma-based pruning removed {sigma_pruned} patterns")
+												
+												# Age-based pruning: remove oldest N% of patterns with low weights
+												# Only apply if enabled and we have enough patterns
+												age_pruned = 0
+												if age_pruning_enabled and len(filtered) > 100:
+													# Calculate the age cutoff (oldest percentile threshold)
+													ages_sorted = sorted([age for (_, _, _, _, age) in filtered], reverse=True)
+													cutoff_index = int(len(ages_sorted) * age_pruning_percentile)
+													if cutoff_index > 0 and cutoff_index < len(ages_sorted):
+														age_cutoff = ages_sorted[cutoff_index]
+														debug_print(f"[DEBUG] TRAINER: Age cutoff for oldest {age_pruning_percentile*100}%: {age_cutoff} validations")
+														
+														# Filter: keep pattern if (age <= cutoff) OR (weight >= limit)
+														# Remove only if (age > cutoff) AND (weight < limit)
+														age_filtered = []
+														for mem, w, hw, lw, age in filtered:
+															try:
+																if age <= age_cutoff or float(w) >= age_pruning_weight_limit:
+																	age_filtered.append((mem, w, hw, lw, age))
+															except (ValueError, TypeError):
+																age_filtered.append((mem, w, hw, lw, age))  # Keep on error
+														
+														age_pruned = len(filtered) - len(age_filtered)
+														filtered = age_filtered
+														debug_print(f"[DEBUG] TRAINER: Age-based pruning removed {age_pruned} stale patterns (age>{age_cutoff}, weight<{age_pruning_weight_limit})")
+												
+												# Unzip filtered results and rebuild all lists including ages
 												if filtered:
-													_mem["memory_list"], _mem["weight_list"], _mem["high_weight_list"], _mem["low_weight_list"] = zip(*filtered)
+													_mem["memory_list"], _mem["weight_list"], _mem["high_weight_list"], _mem["low_weight_list"], ages = zip(*filtered)
 													_mem["memory_list"] = list(_mem["memory_list"])
 													_mem["weight_list"] = list(_mem["weight_list"])
 													_mem["high_weight_list"] = list(_mem["high_weight_list"])
 													_mem["low_weight_list"] = list(_mem["low_weight_list"])
+													ages = list(ages)
 													# Rebuild pre-split patterns after pruning
-													_mem["memory_patterns"] = [mem.split('{}')[0].split(' ') for mem in _mem["memory_list"]]
+													_mem["memory_patterns"] = [mem.split('{}')[0].split('|') for mem in _mem["memory_list"]]
 												else:
 													_mem["memory_list"] = []
 													_mem["weight_list"] = []
 													_mem["high_weight_list"] = []
 													_mem["low_weight_list"] = []
 													_mem["memory_patterns"] = []
+													ages = []
+												
+												# Sync age cache with pruned memory
+												_pattern_ages[tf_choice] = ages
 												_mem["dirty"] = True
 												
-												pruned_count = original_count - len(_mem["memory_list"])
-												if pruned_count > 0:
-													debug_print(f"[DEBUG] TRAINER: Pruned {pruned_count} weak patterns ({original_count} -> {len(_mem['memory_list'])})")
+												total_pruned = original_count - len(_mem["memory_list"])
+												if total_pruned > 0:
+													debug_print(f"[DEBUG] TRAINER: Total pruned {total_pruned} patterns ({original_count} -> {len(_mem['memory_list'])}) [sigma: {sigma_pruned}, age: {age_pruned}]")
 										except Exception as e:
 											debug_print(f"[DEBUG] TRAINER: Pruning failed (non-critical): {e}")
 										
@@ -1797,107 +2071,105 @@ while True:
 										debug_print(f'Timeframes in bounce_accuracy_dict: {list(bounce_accuracy_dict.keys())}')
 										# Check if we've processed all timeframes
 										if the_big_index >= len(tf_choices):
-											if len(number_of_candles) == 1:
-												print("Finished processing all timeframes. Exiting.")
-												
-												# Flush all buffered data (thresholds + memory/weights) before marking complete
-												flush_all_buffers(force=True)
-												
-												# Save and print bounce accuracy summary
-												try:
-													if bounce_accuracy_dict:
-														# Calculate average
-														avg_accuracy = sum(bounce_accuracy_dict.values()) / len(bounce_accuracy_dict)
-														
-														# Save to file
-														timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-														with open('bounce_accuracy.txt', 'w', encoding='utf-8') as f:
-															f.write(f'Last Updated: {timestamp}\n')
-															f.write(f'Average: {avg_accuracy:.2f}%\n')
-															for tf in tf_choices:
-																if tf in bounce_accuracy_dict:
-																	f.write(f'{tf}: {bounce_accuracy_dict[tf]:.2f}%\n')
-														
-														# Print summary
-														print()  # Empty line before bounce accuracy
-														print(f'Limit-Breach Accuracy Results ({_arg_coin})')
-														print(f'Last trained: {timestamp}')
-														print(f'Average accuracy: {avg_accuracy:.2f}%')
-														tf_results = ', '.join([f'{tf}={bounce_accuracy_dict[tf]:.2f}%' for tf in tf_choices if tf in bounce_accuracy_dict])
-														print(f'Per timeframe: {tf_results}')
-														
-														# Check for suspicious accuracy (99-100% often indicates incomplete training)
-														suspicious_accuracy = False
+											print("Finished processing all timeframes. Exiting.")
+											
+											# Flush all buffered data (thresholds + memory/weights) before marking complete
+											flush_all_buffers(force=True)
+											
+											# Save and print bounce accuracy summary
+											try:
+												if bounce_accuracy_dict:
+													# Calculate average
+													avg_accuracy = sum(bounce_accuracy_dict.values()) / len(bounce_accuracy_dict)
+													
+													# Save to file
+													timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+													with open('bounce_accuracy.txt', 'w', encoding='utf-8') as f:
+														f.write(f'Last Updated: {timestamp}\n')
+														f.write(f'Average: {avg_accuracy:.2f}%\n')
 														for tf in tf_choices:
-															if tf in bounce_accuracy_dict and bounce_accuracy_dict[tf] >= 99.0:
-																suspicious_accuracy = True
-																break
-														
-														if suspicious_accuracy:
-															print()
-															print(f'⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.')
-															print(f'⚠ Please verify that training completed properly and memories were saved.')
-												except Exception as e:
-													print(f'Warning: Could not save bounce accuracy: {e}')
-												
-												# Check if memory files are empty (indicates training failure)
-												training_valid = True
-												empty_memories = []
-												try:
+															if tf in bounce_accuracy_dict:
+																f.write(f'{tf}: {bounce_accuracy_dict[tf]:.2f}%\n')
+													
+													# Print summary
+													print()  # Empty line before bounce accuracy
+													print(f'Limit-Breach Accuracy Results ({_arg_coin})')
+													print(f'Last trained: {timestamp}')
+													print(f'Average accuracy: {avg_accuracy:.2f}%')
+													tf_results = ', '.join([f'{tf}={bounce_accuracy_dict[tf]:.2f}%' for tf in tf_choices if tf in bounce_accuracy_dict])
+													print(f'Per timeframe: {tf_results}')
+													
+													# Check for suspicious accuracy (99-100% often indicates incomplete training)
+													suspicious_accuracy = False
 													for tf in tf_choices:
-														memory_file = f"memories_{tf}.dat"
-														if os.path.isfile(memory_file):
-															file_size = os.path.getsize(memory_file)
-															if file_size < 100:  # Less than 100 bytes is effectively empty
-																empty_memories.append(tf)
-																training_valid = False
-														else:
-															# Memory file doesn't exist at all
+														if tf in bounce_accuracy_dict and bounce_accuracy_dict[tf] >= 99.0:
+															suspicious_accuracy = True
+															break
+													
+													if suspicious_accuracy:
+														print()
+														print(f'⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.')
+														print(f'⚠ Please verify that training completed properly and memories were saved.')
+											except Exception as e:
+												print(f'Warning: Could not save bounce accuracy: {e}')
+											
+											# Check if memory files are empty (indicates training failure)
+											training_valid = True
+											empty_memories = []
+											try:
+												for tf in tf_choices:
+													memory_file = f"memories_{tf}.dat"
+													if os.path.isfile(memory_file):
+														file_size = os.path.getsize(memory_file)
+														if file_size < 100:  # Less than 100 bytes is effectively empty
 															empty_memories.append(tf)
 															training_valid = False
-													
-													if not training_valid:
-														print()
-														print(f'❌ ERROR: Training failed - memory files are empty or missing for: {", ".join(empty_memories)}')
-														print(f'❌ Training will be marked as FAILED. Please retry training.')
-												except Exception as e:
-													print(f'Warning: Could not validate memory files: {e}')
+													else:
+														# Memory file doesn't exist at all
+														empty_memories.append(tf)
+														training_valid = False
 												
-												try:
-													file = open('trainer_last_start_time.txt','w+')
-													file.write(str(start_time_yes))
-													file.close()
-												except:
-													pass
-
+												if not training_valid:
+													print()
+													print(f'❌ ERROR: Training failed - memory files are empty or missing for: {", ".join(empty_memories)}')
+													print(f'❌ Training will be marked as FAILED. Please retry training.')
+											except Exception as e:
+												print(f'Warning: Could not validate memory files: {e}')
+											
+											try:
+												file = open('trainer_last_start_time.txt','w+')
+												file.write(str(start_time_yes))
+												file.close()
+											except:
+												pass
 												# Mark training finished (or failed) for the GUI
-												try:
-													_trainer_finished_at = int(time.time())
-													
-													# Only write last_training_time if training was valid
-													if training_valid:
-														file = open('trainer_last_training_time.txt','w+')
-														file.write(str(_trainer_finished_at))
-														file.close()
-												except:
-													pass
-												try:
-													with open("trainer_status.json", "w", encoding="utf-8") as f:
-														json.dump(
-															{
-																"coin": _arg_coin,
-																"state": "FINISHED" if training_valid else "FAILED",
-																"started_at": _trainer_started_at,
-																"finished_at": _trainer_finished_at,
-																"timestamp": _trainer_finished_at,
-																"error": "Empty memory files" if not training_valid else None,
-															},
-															f,
-														)
-												except Exception:
-													pass
+											try:
+												_trainer_finished_at = int(time.time())
+												
+												# Only write last_training_time if training was valid
+												if training_valid:
+													file = open('trainer_last_training_time.txt','w+')
+													file.write(str(_trainer_finished_at))
+													file.close()
+											except:
+												pass
+											try:
+												with open("trainer_status.json", "w", encoding="utf-8") as f:
+													json.dump(
+														{
+															"coin": _arg_coin,
+															"state": "FINISHED" if training_valid else "FAILED",
+															"started_at": _trainer_started_at,
+															"finished_at": _trainer_finished_at,
+															"timestamp": _trainer_finished_at,
+															"error": "Empty memory files" if not training_valid else None,
+														},
+														f,
+													)
+											except Exception:
+												pass
 
-												sys.exit(0 if training_valid else 1)
+											sys.exit(0 if training_valid else 1)
 										else:
 											pass
 										break
@@ -2019,20 +2291,70 @@ while True:
 																high_predicted_move_pct = (high_moves[indy]*100)
 																low_predicted_move_pct = (low_moves[indy]*100)
 																
-																# Safe threshold calculation - prevent division/comparison issues with zero values
-																# When predicted_move_pct=0 (flat price), use small absolute threshold instead
-																predicted_move_pct_threshold = abs(predicted_move_pct) * 0.1 if predicted_move_pct != 0 else 0.1
-																high_predicted_move_pct_threshold = abs(high_predicted_move_pct) * 0.1 if high_predicted_move_pct != 0 else 0.1
-																low_predicted_move_pct_threshold = abs(low_predicted_move_pct) * 0.1 if low_predicted_move_pct != 0 else 0.1
+																# Update EWMA volatility with actual move for adaptive thresholds
+																_vol_cache = _volatility_cache.get(tf_choice, {})
+																current_move = abs(perc_diff_now_actual)
+																ewma_vol = _vol_cache.get("ewma_volatility", 2.0)
+																avg_vol = _vol_cache.get("avg_volatility", 2.0)
+																# Update EWMA: new = decay × old + (1-decay) × current
+																ewma_vol = volatility_ewma_decay * ewma_vol + (1 - volatility_ewma_decay) * current_move
+																_vol_cache["ewma_volatility"] = ewma_vol
+																_volatility_cache[tf_choice] = _vol_cache
+																
+																# Volatility-adaptive thresholds scale with market conditions and pattern confidence
+																# Formula: base × |prediction| × (1 + current_vol/avg_vol) × (2.0/weight)
+																# Low vol → tight threshold, high vol → loose threshold
+																# High weight → strict threshold (must maintain performance), low weight → lenient (allow learning)
+																volatility_factor = 1.0 + (ewma_vol / avg_vol)
+																weight_factor_high = 2.0 / max(0.5, float(high_move_weights[indy]))
+																weight_factor_low = 2.0 / max(0.5, float(low_move_weights[indy]))
+																weight_factor_main = 2.0 / max(0.5, float(move_weights[indy]))
+																
+																high_predicted_move_pct_threshold = weight_threshold_base * abs(high_predicted_move_pct) * volatility_factor * weight_factor_high
+																high_predicted_move_pct_threshold = max(weight_threshold_min * abs(high_predicted_move_pct),
+																                                         min(weight_threshold_max * abs(high_predicted_move_pct),
+																                                             high_predicted_move_pct_threshold))
+																
+																low_predicted_move_pct_threshold = weight_threshold_base * abs(low_predicted_move_pct) * volatility_factor * weight_factor_low
+																low_predicted_move_pct_threshold = max(weight_threshold_min * abs(low_predicted_move_pct),
+																                                        min(weight_threshold_max * abs(low_predicted_move_pct),
+																                                            low_predicted_move_pct_threshold))
+																
+																predicted_move_pct_threshold = weight_threshold_base * abs(predicted_move_pct) * volatility_factor * weight_factor_main
+																predicted_move_pct_threshold = max(weight_threshold_min * abs(predicted_move_pct),
+																                                    min(weight_threshold_max * abs(predicted_move_pct),
+																                                        predicted_move_pct_threshold))
+																
+																# Fallback for zero predictions to prevent division by zero
+																if high_predicted_move_pct == 0:
+																	high_predicted_move_pct_threshold = 0.1
+																if low_predicted_move_pct == 0:
+																	low_predicted_move_pct_threshold = 0.1
+																if predicted_move_pct == 0:
+																	predicted_move_pct_threshold = 0.1
+																
+																# Calculate normalized error magnitude for each weight type
+																# Step size scales with error: large errors → faster corrections, small errors → gentler adjustments
+																high_error = high_perc_diff_now_actual - high_predicted_move_pct
+																high_error_magnitude = abs(high_error) / max(0.1, abs(high_predicted_move_pct))
+																high_adaptive_step = weight_base_step * min(weight_step_cap, high_error_magnitude)
+																
+																low_error = low_perc_diff_now_actual - low_predicted_move_pct
+																low_error_magnitude = abs(low_error) / max(0.1, abs(low_predicted_move_pct))
+																low_adaptive_step = weight_base_step * min(weight_step_cap, low_error_magnitude)
+																
+																main_error = perc_diff_now_actual - predicted_move_pct
+																main_error_magnitude = abs(main_error) / max(0.1, abs(predicted_move_pct))
+																main_adaptive_step = weight_base_step * min(weight_step_cap, main_error_magnitude)
 																
 																if high_perc_diff_now_actual > high_predicted_move_pct + high_predicted_move_pct_threshold:
-																	high_new_weight = high_move_weights[indy] + 0.25
+																	high_new_weight = high_move_weights[indy] + high_adaptive_step
 																	if high_new_weight > 2.0:
 																		high_new_weight = 2.0
 																	else:
 																		pass
 																elif high_perc_diff_now_actual < high_predicted_move_pct - high_predicted_move_pct_threshold:
-																	high_new_weight = high_move_weights[indy] - 0.25
+																	high_new_weight = high_move_weights[indy] - high_adaptive_step
 																	if high_new_weight < 0.0:
 																		high_new_weight = 0.0
 																	else:
@@ -2040,13 +2362,13 @@ while True:
 																else:
 																	high_new_weight = high_move_weights[indy]
 																if low_perc_diff_now_actual < low_predicted_move_pct - low_predicted_move_pct_threshold:
-																	low_new_weight = low_move_weights[indy] + 0.25
+																	low_new_weight = low_move_weights[indy] + low_adaptive_step
 																	if low_new_weight > 2.0:
 																		low_new_weight = 2.0
 																	else:
 																		pass
 																elif low_perc_diff_now_actual > low_predicted_move_pct + low_predicted_move_pct_threshold:
-																	low_new_weight = low_move_weights[indy] - 0.25
+																	low_new_weight = low_move_weights[indy] - low_adaptive_step
 																	if low_new_weight < 0.0:
 																		low_new_weight = 0.0
 																	else:
@@ -2054,24 +2376,36 @@ while True:
 																else:
 																	low_new_weight = low_move_weights[indy]
 																if perc_diff_now_actual > predicted_move_pct + predicted_move_pct_threshold:
-																	new_weight = move_weights[indy] + 0.25
+																	new_weight = move_weights[indy] + main_adaptive_step
 																	if new_weight > 2.0:
 																		new_weight = 2.0
 																	else:
 																		pass
 																elif perc_diff_now_actual < predicted_move_pct - predicted_move_pct_threshold:
-																	new_weight = move_weights[indy] - 0.25
-																	if new_weight < (0.0-2.0):
-																		new_weight = (0.0-2.0)
+																	new_weight = move_weights[indy] - main_adaptive_step
+																	if new_weight < 0.0:
+																		new_weight = 0.0
 																	else:
 																		pass
 																else:
 																	new_weight = move_weights[indy]
 																
+																# Apply temporal decay toward baseline to prevent saturation and adapt to regime changes
+																# Allows weights to "forget" old adjustments if pattern isn't revalidated
+																# Formula: weight = weight × (1 - rate) + target × rate (exponential moving average)
+																new_weight = new_weight * (1 - weight_decay_rate) + weight_decay_target * weight_decay_rate
+																high_new_weight = high_new_weight * (1 - weight_decay_rate) + weight_decay_target * weight_decay_rate
+																low_new_weight = low_new_weight * (1 - weight_decay_rate) + weight_decay_target * weight_decay_rate
+																
+																# Increment age counter for this pattern (tracks validation count)
+																pattern_idx = perfect_dexs[indy]
+																if tf_choice in _pattern_ages and pattern_idx < len(_pattern_ages[tf_choice]):
+																	_pattern_ages[tf_choice][pattern_idx] += 1
+																
 																# Update cache directly to ensure changes persist (don't rely on references)
-																_mem["weight_list"][perfect_dexs[indy]] = new_weight
-																_mem["high_weight_list"][perfect_dexs[indy]] = high_new_weight
-																_mem["low_weight_list"][perfect_dexs[indy]] = low_new_weight
+																_mem["weight_list"][pattern_idx] = new_weight
+																_mem["high_weight_list"][pattern_idx] = high_new_weight
+																_mem["low_weight_list"][pattern_idx] = low_new_weight
 
 																# mark dirty (we will flush in batches)
 																_mem["dirty"] = True
@@ -2091,7 +2425,7 @@ while True:
 														new_pattern = all_current_patterns[highlowind] + [this_diff]
 														debug_print(f"[DEBUG] TRAINER: new_pattern before mem_entry: {len(new_pattern)} candles, highlowind={highlowind}, all_current_patterns[{highlowind}]={len(all_current_patterns[highlowind])} candles")
 														
-														mem_entry = str(new_pattern).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
+														mem_entry = '|'.join([str(x) for x in new_pattern])+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
 														
 														# Strict pattern creation: only append valid, unique, non-empty patterns
 														# However, when memory is small (<1000 patterns), be more permissive to allow initial learning
@@ -2113,14 +2447,17 @@ while True:
 														if skip_pattern:
 															debug_print(f"[DEBUG] TRAINER: Skipped {skip_reason} pattern (memory size: {len(_mem['memory_list'])})")
 														else:
-															candle_count = len(mem_entry.split('{}')[0].split(' '))
+															candle_count = len(mem_entry.split('{}')[0].split('|'))
 															debug_print(f"[DEBUG] TRAINER: Adding pattern with {candle_count} candles to memory (expected: {number_of_candles[number_of_candles_index]})")
 															_mem["memory_list"].append(mem_entry)
 															# Also append pre-split pattern for fast comparison
-															_mem["memory_patterns"].append(mem_entry.split('{}')[0].split(' '))
+															_mem["memory_patterns"].append(mem_entry.split('{}')[0].split('|'))
 															_mem["weight_list"].append(1.0)  # Start with neutral weight
 															_mem["high_weight_list"].append(1.0)
 															_mem["low_weight_list"].append(1.0)
+															# Initialize age for new pattern
+															if tf_choice in _pattern_ages:
+																_pattern_ages[tf_choice].append(0)
 															_mem["dirty"] = True
 															debug_print(f"[DEBUG] TRAINER: Added new pattern to memory (total: {len(_mem['memory_list'])}), candles={candle_count}")
 												except:
