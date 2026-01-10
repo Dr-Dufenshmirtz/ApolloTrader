@@ -2107,7 +2107,7 @@ class ApolloHub(tk.Tk):
         # Show simulation mode banner immediately if enabled (don't wait for first account fetch)
         if bool(self.settings.get("simulation_mode", False)):
             try:
-                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE - NO REAL TRADES ⚠️")
+                self.lbl_simulation_banner.config(text="⚠️ SIMULATION MODE ⚠️")
                 self.lbl_simulation_banner.pack(anchor="w", padx=6, pady=(4, 4), before=self.lbl_acct_total_value)
             except Exception:
                 pass
@@ -2122,9 +2122,9 @@ class ApolloHub(tk.Tk):
 
         self.after(250, self._tick)
         
-        # Display bounce accuracy results on startup (after GUI is ready)
+        # Display accuracy results on startup (after GUI is ready)
         # Increased delay to ensure all widgets are fully initialized
-        self.after(500, self._display_startup_bounce_accuracy)
+        self.after(500, self._display_startup_accuracy)
         
         # Fetch initial account info if API keys are present (displays immediately without starting trader)
         # Delay increased to ensure all widgets are initialized
@@ -5048,8 +5048,8 @@ class ApolloHub(tk.Tk):
         except Exception:
             pass  # Outer exception, skip silently
     
-    def _display_startup_bounce_accuracy(self) -> None:
-        """Display bounce accuracy results for all coins on Hub startup."""
+    def _display_startup_accuracy(self) -> None:
+        """Display bounce accuracy and signal accuracy results for all coins on Hub startup."""
         try:
             trained_coins_found = 0
             
@@ -5060,13 +5060,14 @@ class ApolloHub(tk.Tk):
                     if not coin_folder:
                         continue
                     
-                    accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
+                    bounce_accuracy_file = os.path.join(coin_folder, "bounce_accuracy.txt")
+                    signal_accuracy_file = os.path.join(coin_folder, "signal_accuracy.txt")
                     
                     # Initialize history for this coin if not present
                     if coin not in self.trainer_log_history:
                         self.trainer_log_history[coin] = []
                     
-                    if not os.path.isfile(accuracy_file):
+                    if not os.path.isfile(bounce_accuracy_file):
                         # No training data yet - add a helpful message
                         msg = f"Training Status ({coin})\n"
                         msg += f"Status: Not yet trained\n\n"
@@ -5087,39 +5088,76 @@ class ApolloHub(tk.Tk):
                         continue
                     
                     try:
-                        with open(accuracy_file, 'r', encoding='utf-8') as f:
-                            lines = f.read().strip().split('\n')
+                        # Read bounce accuracy file
+                        with open(bounce_accuracy_file, 'r', encoding='utf-8') as f:
+                            bounce_lines = f.read().strip().split('\n')
                         
-                        if len(lines) < 2:
+                        if len(bounce_lines) < 2:
                             continue
                         
-                        # Parse file content
-                        timestamp = lines[0].replace('Last Updated: ', '').strip()
-                        average = lines[1].replace('Average: ', '').strip()
+                        # Parse bounce accuracy content
+                        timestamp = bounce_lines[0].replace('Last Updated: ', '').strip()
+                        bounce_average = bounce_lines[1].replace('Average: ', '').strip()
                         
-                        # Build timeframe results string and check for suspicious accuracy
-                        tf_results = []
+                        # Parse bounce accuracy per timeframe
+                        bounce_tf_dict = {}
                         suspicious_accuracy = False
-                        for line in lines[2:]:
+                        for line in bounce_lines[2:]:
                             if ':' in line:
-                                tf_results.append(line.replace(': ', '=').strip())
+                                parts = line.split(':')
+                                tf = parts[0].strip()
+                                value = parts[1].strip()
+                                bounce_tf_dict[tf] = value
                                 # Check if any timeframe has >= 99% accuracy
                                 try:
-                                    accuracy_value = float(line.split(':')[1].strip().replace('%', ''))
+                                    accuracy_value = float(value.replace('%', ''))
                                     if accuracy_value >= 99.0:
                                         suspicious_accuracy = True
                                 except:
                                     pass
+                        
+                        # Try to read signal accuracy file
+                        signal_average = None
+                        signal_tf_dict = {}
+                        if os.path.isfile(signal_accuracy_file):
+                            try:
+                                with open(signal_accuracy_file, 'r', encoding='utf-8') as f:
+                                    signal_lines = f.read().strip().split('\n')
+                                
+                                if len(signal_lines) >= 2:
+                                    signal_average = signal_lines[1].replace('Average: ', '').strip()
+                                    
+                                    # Parse signal accuracy per timeframe
+                                    for line in signal_lines[2:]:
+                                        if ':' in line:
+                                            parts = line.split(':')
+                                            tf = parts[0].strip()
+                                            value = parts[1].strip()
+                                            signal_tf_dict[tf] = value
+                            except:
+                                pass  # Signal accuracy not critical, skip if unavailable
                         
                         # Use the same training validation logic as the training window
                         if self._coin_is_trained(coin):
                             trained_coins_found += 1
                         
                         # Format and display
-                        msg = f"Bounce Accuracy Results ({coin})\n"
-                        msg += f"Last trained: {timestamp}\n"
-                        msg += f"Average accuracy: {average}\n"
-                        msg += f"Per timeframe: {', '.join(tf_results)}\n\n"
+                        msg = f"=== Training Accuracy Results ({coin}) ===\n"
+                        msg += f"Last trained: {timestamp}\n\n"
+                        msg += f"Average Limit-Breach Accuracy: {bounce_average}\n"
+                        if signal_average:
+                            msg += f"Average Signal Accuracy:       {signal_average}\n"
+                        msg += f"\nPer Timeframe:\n"
+                        
+                        # Display per-timeframe results
+                        for tf in sorted(bounce_tf_dict.keys()):
+                            bounce_val = bounce_tf_dict[tf]
+                            if signal_tf_dict and tf in signal_tf_dict:
+                                signal_val = signal_tf_dict[tf]
+                                msg += f"  {tf:8} | Limit: {bounce_val:>6} | Signal: {signal_val:>6}\n"
+                            else:
+                                msg += f"  {tf:8} | Limit: {bounce_val:>6}\n"
+                        msg += "\n"
                         
                         # Add warning if suspicious accuracy detected
                         if suspicious_accuracy:

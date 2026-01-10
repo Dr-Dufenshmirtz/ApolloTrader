@@ -144,22 +144,20 @@ def handle_network_error(operation: str, error: Exception):
 	_circuit_breaker["last_error_time"] = time.time()
 	
 	print(f"\n{'='*60}")
-	print(f"NETWORK ERROR #{_circuit_breaker['consecutive_errors']}: {operation} failed")
+	print(f"❌ NETWORK ERROR #{_circuit_breaker['consecutive_errors']}: {operation} failed")
 	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
 	
 	if _circuit_breaker["consecutive_errors"] >= _circuit_breaker["max_errors_before_open"]:
 		if not _circuit_breaker["is_open"]:
 			_circuit_breaker["is_open"] = True
-			print(f"")
-			print(f"CIRCUIT BREAKER ACTIVATED (after {_circuit_breaker['consecutive_errors']} consecutive errors)")
-			print(f"Trading PAUSED for {_circuit_breaker['cooldown_seconds']}s, but monitoring continues.")
-			print(f"Will auto-recover when API connectivity restored.")
+			print(f"⚠ CIRCUIT BREAKER ACTIVATED (after {_circuit_breaker['consecutive_errors']} consecutive errors)")
+			print(f"Trading PAUSED for {_circuit_breaker['cooldown_seconds']}s, monitoring continues")
+			print(f"Will auto-recover when API connectivity restored")
 		else:
-			print(f"Circuit breaker still OPEN, trading paused.")
+			print(f"⚠ Circuit breaker still OPEN, trading paused")
 	else:
 		print(f"Retrying... ({_circuit_breaker['max_errors_before_open'] - _circuit_breaker['consecutive_errors']} attempts left before circuit opens)")
 	
-	print(f"")
 	print(f"Please check:")
 	print(f"  1. Your internet connection")
 	print(f"  2. API service status (Robinhood)")
@@ -179,7 +177,7 @@ def reset_circuit_breaker():
 		if was_open:
 			print(f"\n{'='*60}")
 			print(f"CIRCUIT BREAKER CLOSED - API connectivity restored")
-			print(f"Resuming normal trading operations.")
+			print(f"Resuming normal trading operations")
 			print(f"{'='*60}\n")
 		debug_print(f"[DEBUG] TRADER: Circuit breaker reset after successful API call")
 
@@ -314,7 +312,9 @@ try:
     else:
         API_KEY = ""
 except Exception as e:
-    print(f"[ApolloTrader] Error reading API key: {e}")
+    print(f"\n{'!'*60}")
+    print(f"❌ ERROR: Failed to read API key: {e}")
+    print(f"{'!'*60}\n")
     API_KEY = ""
 
 try:
@@ -324,7 +324,9 @@ try:
     else:
         BASE64_PRIVATE_KEY = ""
 except Exception as e:
-    print(f"[ApolloTrader] Error reading private key: {e}")
+    print(f"\n{'!'*60}")
+    print(f"❌ ERROR: Failed to read private key: {e}")
+    print(f"{'!'*60}\n")
     BASE64_PRIVATE_KEY = ""
 
 if not API_KEY or not BASE64_PRIVATE_KEY:
@@ -809,7 +811,7 @@ class CryptoAPITrading:
         """
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
-            print("No holdings found. Skipping DCA levels initialization.")
+            print("No holdings found, skipping DCA initialization")
             return
 
         for holding in holdings.get("results", []):
@@ -912,7 +914,7 @@ class CryptoAPITrading:
             # This makes neural-vs-hardcoded clean, and allows repeating the -50% stage indefinitely.
             self.dca_levels_triggered[symbol] = list(range(triggered_levels_count))
             debug_print(f"[DEBUG] TRADER: Initialized DCA stages for {symbol}: {triggered_levels_count} (holding_qty={holding_qty})")
-            print(f"Initialized DCA stages for {symbol}: {triggered_levels_count}")
+            print(f"[{symbol}] Initialized DCA stages: {triggered_levels_count}")
 
     def _seed_dca_window_from_history(self) -> None:
         """
@@ -1012,7 +1014,7 @@ class CryptoAPITrading:
         debug_print(f"  Processed: {processed_dca_buys} DCA buys, {processed_sells} sells")
         skipped_total = skipped_empty + skipped_invalid_json + skipped_missing_fields + skipped_invalid_timestamp
         if skipped_total > 0:
-            print(f"WARNING: Skipped {skipped_total} invalid entries in trade history:")
+            print(f"⚠ WARNING: Skipped {skipped_total} invalid entries in trade history:")
             if skipped_empty > 0:
                 debug_print(f"  - {skipped_empty} empty lines")
             if skipped_invalid_json > 0:
@@ -1792,17 +1794,6 @@ class CryptoAPITrading:
             }
 
         os.system('cls' if os.name == 'nt' else 'clear')
-        print()
-        print("--- Account Summary ---")
-        print(f"Total Account Value: ${total_account_value:.2f}")
-        print(f"Holdings Value: ${holdings_sell_value:.2f}")
-        print(f"Percent In Trade: {in_use:.2f}%")
-        print(
-            f"Trailing PM: start +{self.pm_start_pct_no_dca:.2f}% (no DCA) / +{self.pm_start_pct_with_dca:.2f}% (with DCA) "
-            f"| gap {self.trailing_gap_pct:.2f}%"
-        )
-        print()
-        print("--- Current Trades ---")
 
         positions = {}
         for holding in holdings.get("results", []):
@@ -1819,7 +1810,7 @@ class CryptoAPITrading:
 
             # Validate prices before any calculations to prevent division errors
             if current_buy_price <= 0 or current_sell_price <= 0:
-                print(f"  WARNING: Invalid prices for {symbol} (buy: ${current_buy_price}, sell: ${current_sell_price}). Skipping trading decisions.")
+                print(f"⚠ [{symbol}] WARNING: Invalid prices (buy: ${current_buy_price}, sell: ${current_sell_price}) - Skipping")
                 debug_print(f"[DEBUG] TRADER: Skipping {symbol} - invalid prices detected")
                 # Still add to positions dict with zeros so GUI shows the holding exists
                 positions[symbol] = {
@@ -1848,7 +1839,7 @@ class CryptoAPITrading:
             else:
                 gain_loss_percentage_buy = 0
                 gain_loss_percentage_sell = 0
-                print(f"  Warning: Average Cost Basis is 0 for {symbol}, Gain/Loss calculation skipped.")
+                print(f"⚠ [{symbol}] Warning: Average cost basis is 0, P&L calculation skipped")
 
             value = quantity * current_sell_price
             triggered_levels_count = len(self.dca_levels_triggered.get(symbol, []))
@@ -2002,22 +1993,19 @@ class CryptoAPITrading:
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
             }
 
-            print(
-                f"\nSymbol: {symbol}"
-                f"  |  DCA: {color}{dca_line_pct:+.2f}%{Style.RESET_ALL} @ {self._fmt_price(current_buy_price)} (Line: {dca_line_price_disp} {dca_line_source} | Next: {next_dca_display})"
-                f"  |  Gain/Loss SELL: {color2}{gain_loss_percentage_sell:.2f}%{Style.RESET_ALL} @ {self._fmt_price(current_sell_price)}"
-                f"  |  DCA Levels Triggered: {triggered_levels}"
-                f"  |  Trade Value: ${value:.2f}"
-            )
-
+            # Clean display output
+            print(f"[{symbol}] Current Price: Buy ${self._fmt_price(current_buy_price)} | Sell ${self._fmt_price(current_sell_price)}")
+            print(f"[{symbol}] Position: {quantity:.8f} @ ${self._fmt_price(avg_cost_basis)} avg cost | Value: ${value:.2f}")
+            print(f"[{symbol}] P&L: Buy {color}{dca_line_pct:+.2f}%{Style.RESET_ALL} | Sell {color2}{gain_loss_percentage_sell:+.2f}%{Style.RESET_ALL}")
+            print(f"[{symbol}] DCA: {triggered_levels} levels triggered | Next: {next_dca_display} | Line: {dca_line_price_disp} ({dca_line_source})")
+            
             if avg_cost_basis > 0:
-                print(
-                    f"  Trailing Profit Margin"
-                    f"  |  Line: {self._fmt_price(trail_line_disp)}"
-                    f"  |  Above: {above_disp}"
-                )
+                trail_indicator = "[ON]" if trail_status == "ON" else "[OFF]"
+                above_text = "ABOVE" if above_disp else "below"
+                print(f"[{symbol}] Trailing PM: {trail_indicator} Line ${self._fmt_price(trail_line_disp)} | Price {above_text} line ({dist_to_trail_pct:+.2f}%)")
             else:
-                print("  PM/Trail: N/A (avg_cost_basis is 0)")
+                print(f"[{symbol}] Trailing PM: N/A (no cost basis)")
+            print()
 
             # Trailing profit margin logic with 0.5% trail gap. The PM "start line" is the normal
             # 5% or 2.5% line depending on whether DCA occurred. Trailing activates once price
@@ -2093,11 +2081,8 @@ class CryptoAPITrading:
                             state["active"] = False
                             state["was_above"] = False
                         else:
-                            print(
-                                f"{sim_prefix()}  Trailing PM hit for {symbol}. "
-                                f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}. "
-                                f"Expected PnL: {expected_pnl_pct:.2f}%"
-                            )
+                            print(f"[{symbol}] Trailing PM triggered: Price ${current_sell_price:.8f} fell below line ${state['line']:.8f}")
+                            print(f"[{symbol}] Expected P&L: {expected_pnl_pct:+.2f}%{sim_prefix()}")
                             debug_print(f"[DEBUG] TRADER: Executing trailing PM sell for {symbol}, expected_pnl={expected_pnl_pct:.2f}%")
                             response = self.place_sell_order(
                                 str(uuid.uuid4()),
@@ -2119,7 +2104,7 @@ class CryptoAPITrading:
                                 # Trade ended -> reset rolling 24h DCA window for this coin
                                 self._reset_dca_window_for_trade(symbol, sold=True)
 
-                                print(f"{sim_prefix()}  Successfully sold {quantity} {symbol}.")
+                                print(f"[{symbol}] Sell order successful: {quantity:.8f} {symbol}{sim_prefix()}")
                                 debug_print(f"[DEBUG] TRADER: Trailing PM sell successful for {symbol}")
                                 trading_cfg = _load_trading_config()
                                 post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 5)
@@ -2128,7 +2113,7 @@ class CryptoAPITrading:
                                 continue
                             else:
                                 # Sell failed - reset was_above to prevent repeated attempts
-                                print(f"  WARNING: Trailing sell order failed for {symbol}. Resetting state to prevent re-trigger.")
+                                print(f"⚠ [{symbol}] WARNING: Trailing sell order FAILED - resetting state")
                                 debug_print(f"[DEBUG] TRADER: Trailing PM sell failed for {symbol}, response: {response}")
                                 state["was_above"] = False
                                 # Don't continue - allow normal state update below to proceed
@@ -2165,7 +2150,7 @@ class CryptoAPITrading:
                 # Check if this DCA stage already triggered this cycle
                 if symbol in self._dca_triggered_this_cycle:
                     if current_stage in self._dca_triggered_this_cycle[symbol]:
-                        print(f"  Skipping DCA for {symbol} stage {current_stage + 1} - already triggered this cycle.")
+                        print(f"[{symbol}] DCA Stage {current_stage + 1} already triggered this cycle - skipped")
                         debug_print(f"[DEBUG] TRADER: DCA stage {current_stage + 1} already triggered for {symbol} this cycle")
                         continue  # Skip to avoid double-triggering
 
@@ -2176,22 +2161,17 @@ class CryptoAPITrading:
                 else:
                     reason = f"HARD {hard_level:.2f}%"
 
-                print(f"{sim_prefix()}  DCAing {symbol} (stage {current_stage + 1}) via {reason}.")
+                print(f"[{symbol}] DCA Stage {current_stage + 1} triggered via {reason}")
                 debug_print(f"[DEBUG] TRADER: Attempting DCA stage {current_stage + 1} for {symbol} via {reason}")
 
-                print(f"  Current Value: ${value:.2f}")
                 trading_cfg = _load_trading_config()
                 dca_multiplier = trading_cfg.get("dca", {}).get("position_multiplier", 2.0)
                 dca_amount = value * dca_multiplier
-                print(f"  DCA Amount: ${dca_amount:.2f}")
-                print(f"  Buying Power: ${buying_power:.2f}")
+                print(f"[{symbol}] Current Value: ${value:.2f} | DCA Amount: ${dca_amount:.2f} | Buying Power: ${buying_power:.2f}")
 
                 recent_dca = self._dca_window_count(symbol)
                 if recent_dca >= int(getattr(self, "max_dca_buys_per_window", 2)):
-                    print(
-                        f"  Skipping DCA for {symbol}. "
-                        f"Already placed {recent_dca} DCA buys in the last {self.dca_window_seconds/3600:.0f}h (max {self.max_dca_buys_per_window})."
-                    )
+                    print(f"[{symbol}] DCA skipped: {recent_dca} buys in last {self.dca_window_seconds/3600:.0f}h (max {self.max_dca_buys_per_window})")
 
                 elif dca_amount <= buying_power:
                     response = self.place_buy_order(
@@ -2205,7 +2185,6 @@ class CryptoAPITrading:
                         tag="DCA",
                     )
 
-                    print(f"  Buy Response: {response}")
                     if response and "errors" not in response:
                         # record that we completed THIS stage (no matter what triggered it)
                         self.dca_levels_triggered.setdefault(symbol, []).append(current_stage)
@@ -2222,11 +2201,11 @@ class CryptoAPITrading:
                         self.trailing_pm.pop(symbol, None)
 
                         trades_made = True
-                        print(f"{sim_prefix()}  Successfully placed DCA buy order for {symbol}.")
+                        print(f"[{symbol}] DCA buy order successful{sim_prefix()}")
                     else:
-                        print(f"{sim_prefix()}  Failed to place DCA buy order for {symbol}.")
+                        print(f"[{symbol}] DCA buy order FAILED{sim_prefix()}")
                 else:
-                    print(f"  Skipping DCA for {symbol}. Not enough funds.")
+                    print(f"[{symbol}] DCA skipped: Insufficient funds")
 
             else:
                 pass
@@ -2338,10 +2317,7 @@ class CryptoAPITrading:
                 # Reset trailing PM state for this coin (fresh trade, fresh trailing logic)
                 self.trailing_pm.pop(base_symbol, None)
 
-                print(
-                    f"{sim_prefix()}Starting new trade for {full_symbol} (AI start signal long={buy_count}, short={sell_count}). "
-                    f"Allocating ${allocation_in_usd:.2f}."
-                )
+                print(f"[{base_symbol}] Entry signal triggered: Long={buy_count} Short={sell_count} | Allocating ${allocation_in_usd:.2f}{sim_prefix()}")
                 trading_cfg = _load_trading_config()
                 post_delay = trading_cfg.get("timing", {}).get("post_trade_delay_seconds", 5)
                 time.sleep(post_delay)

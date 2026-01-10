@@ -100,7 +100,7 @@ def debug_print(msg: str):
 		except Exception as e:
 			# If logging fails, print to console with full error details
 			print(f"\n{'!'*60}")
-			print(f"[DEBUG LOG ERROR] Failed to write to {log_file}")
+			print(f"❌ [DEBUG LOG ERROR] Failed to write to {log_file}")
 			print(f"Error: {type(e).__name__}: {e}")
 			print(f"Working directory: {os.getcwd()}")
 			print(f"{'!'*60}\n")
@@ -109,7 +109,7 @@ def debug_print(msg: str):
 def handle_network_error(operation: str, error: Exception):
 	"""Print network error and suggest enabling debug mode"""
 	print(f"\n{'='*60}")
-	print(f"NETWORK ERROR: {operation} failed")
+	print(f"❌ NETWORK ERROR: {operation} failed")
 	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
 	print(f"The process will exit. Please check:")
 	print(f"  1. Your internet connection")
@@ -495,7 +495,7 @@ def check_and_update_trainer_version():
 		# DISABLED: Hub already handles version management
 		if False:  # Permanently disabled
 			print(f"\n{'='*60}")
-			print(f"TRAINER CHECKSUM CHECK: Cannot read root trainer")
+			print(f"⚠ TRAINER CHECKSUM CHECK: Cannot read root trainer")
 			print(f"Forcing update from root as safety measure...")
 			print(f"{'='*60}\n")
 			
@@ -520,7 +520,7 @@ def check_and_update_trainer_version():
 		# Trainer self-update causes infinite restart loop when Hub also validates checksums
 		if False:  # Permanently disabled
 			print(f"\n{'='*60}")
-			print(f"TRAINER FILE MISMATCH DETECTED (checksum differs)")
+			print(f"⚠ TRAINER FILE MISMATCH DETECTED (checksum differs)")
 			print(f"Updating trainer from root and restarting...")
 			print(f"{'='*60}\n")
 			
@@ -546,7 +546,7 @@ def check_and_update_trainer_version():
 	except Exception as e:
 		# Don't crash on version check failure - just log and continue
 		debug_print(f"[DEBUG] TRAINER: Checksum check failed: {e}")
-		print(f"Warning: Trainer checksum check failed: {e}")
+		print(f"⚠ Warning: Trainer checksum check failed: {e}")
 
 def restart_program():
 	"""Restarts the current program, with file objects and descriptors cleanup"""
@@ -666,7 +666,7 @@ except:
 # Coin argument is REQUIRED - no default fallback
 
 if len(sys.argv) < 2 or not str(sys.argv[1]).strip():
-	print("ERROR: Coin symbol required as first argument")
+	print("❌ ERROR: Coin symbol required as first argument")
 	print("Usage: python pt_trainer.py <COIN> [reprocess_yes|reprocess_no]")
 	print("Example: python pt_trainer.py BTC")
 	sys.exit(1)
@@ -686,7 +686,7 @@ def _signal_handler(signum, frame):
 	try:
 		flush_all_buffers(force=True)
 	except Exception as e:
-		print(f"Warning: Error flushing buffers: {e}")
+		print(f"⚠ Warning: Error flushing buffers: {e}")
 	
 	try:
 		with open("trainer_status.json", "w", encoding="utf-8") as f:
@@ -757,15 +757,16 @@ try:
 	print(f"{'='*60}\n")
 	
 	if not debug_enabled:
-		print(f"WARNING: Debug mode is DISABLED in gui_settings.json")
+		print(f"⚠ WARNING: Debug mode is DISABLED in gui_settings.json")
 		print(f"         Enable it to see detailed training logs")
 		print(f"         Startup message written to {log_file} for verification\n")
 except Exception as e:
-	print(f"ERROR: Failed to initialize debug logging: {e}")
+	print(f"❌ ERROR: Failed to initialize debug logging: {e}")
 	PrintException()
 
 the_big_index = 0
 bounce_accuracy_dict = {}  # Store bounce accuracy for each timeframe
+signal_accuracy_dict = {}  # Store signal accuracy for each timeframe
 # Main training loop note:
 # The primary loop below (`while True:`) resets per-iteration state and
 # then performs training/analysis for the configured `tf_choice`. It is
@@ -788,6 +789,7 @@ while True:
 	upordown2 = []
 	upordown3 = []
 	upordown4 = []
+	upordown_signal = []  # Track signal directional accuracy
 	debug_print(f"[DEBUG] TRAINER: Starting timeframe {tf_choices[the_big_index]} (index {the_big_index}/{len(tf_choices)-1})")
 	tf_choice = tf_choices[the_big_index]
 	debug_print(f"[DEBUG] TRAINER: Starting training cycle for {_arg_coin} on timeframe {tf_choice}...")
@@ -906,7 +908,7 @@ while True:
 					raise ValueError("Invalid timestamp in candle data")
 			except (ValueError, IndexError) as e:
 				kucoin_retry_count += 1
-				print(f"WARNING: Received malformed data from API (batch had {len(history)} entries)")
+				print(f"⚠ WARNING: Received malformed data from API (batch had {len(history)} entries)")
 				print(f"Sample entry: {sample_entry}")
 				print(f"Retrying data fetch... (attempt {kucoin_retry_count}/{kucoin_max_retries})")
 				
@@ -990,7 +992,7 @@ while True:
 			except Exception as e:
 				parse_error_count += 1
 				if parse_error_count <= 3:  # Only print first few errors to avoid spam
-					print(f"WARNING: Failed to parse candle at index {index}: {working_minute}")
+					print(f"⚠ WARNING: Failed to parse candle at index {index}: {working_minute}")
 					PrintException()
 				if parse_error_count > max_parse_errors:
 					error_msg = f"ERROR: Too many parse errors ({parse_error_count}) in historical data for {timeframe}. Data may be corrupted."
@@ -1026,13 +1028,13 @@ while True:
 		
 		# Validate we have historical data before proceeding
 		if len(price_list) == 0 or len(high_price_list) == 0 or len(low_price_list) == 0 or len(open_price_list) == 0:
-			print(f"ERROR: Failed to fetch historical price data for {_arg_coin} on {timeframe} timeframe. Cannot train without historical data.")
+			print(f"❌ ERROR: Failed to fetch historical price data for {_arg_coin} on {timeframe} timeframe. Cannot train without historical data.")
 			mark_training_error(f"No historical data for {timeframe}")
 			sys.exit(1)
 		
 		# Validate we have minimum data to train (need at least 12 candles for meaningful patterns)
 		if len(price_list) < 12:
-			print(f"WARNING: Insufficient data for {_arg_coin} on {timeframe} timeframe ({len(price_list)} candles, minimum 12 required).")
+			print(f"⚠ WARNING: Insufficient data for {_arg_coin} on {timeframe} timeframe ({len(price_list)} candles, minimum 12 required).")
 			print(f"         Skipping this timeframe and continuing to next...")
 			the_big_index += 1
 			if the_big_index < len(tf_choices):
@@ -1086,6 +1088,7 @@ while True:
 	price_list_length = initial_skip + 1
 	last_printed_candle = 0  # Track last candle we printed status for
 	last_printed_accuracy = None  # Track accuracy at last print for trend arrows
+	last_printed_signal_accuracy = None  # Track signal accuracy at last print for trend arrows
 	debug_print(f"[DEBUG] TRAINER: Skipping first {initial_skip} candles (2% of {len(price_list)} with min 12) to avoid volatile startup period")
 	debug_print(f"[DEBUG] TRAINER: Starting window size: {price_list_length} candles (total: {len(price_list)})")
 	
@@ -1549,7 +1552,8 @@ while True:
 					# Status output
 					pid_state = get_pid_state(tf_choice)
 					bounce_accuracy = bounce_accuracy_dict.get(tf_choice, 0.0)
-					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.4f} | matches={match_count}/{target_matches} (target={target_percentage*100:.2f}%) | PID_Σ={pid_state['integral_error']:.3f} | match_acc={current_accuracy:.1f}% | bounce_acc={bounce_accuracy:.1f}% | patterns={pattern_count:,}")
+					signal_accuracy = signal_accuracy_dict.get(tf_choice, 0.0)
+					debug_print(f"[DEBUG] TRAINER: threshold={perfect_threshold:.4f} | matches={match_count}/{target_matches} (target={target_percentage*100:.2f}%) | PID_Σ={pid_state['integral_error']:.3f} | match_acc={current_accuracy:.1f}% | limit_acc={bounce_accuracy:.1f}% | sig_acc={signal_accuracy:.1f}% | patterns={pattern_count:,}")
 					
 					# Buffer threshold in memory instead of writing to disk
 					buffer_threshold(tf_choice, perfect_threshold)
@@ -1729,7 +1733,7 @@ while True:
 							new_y = [0.0, 0.0]
 						number_of_candles_index += 1
 						if number_of_candles_index >= len(number_of_candles):
-							print("ERROR: Processed all number_of_candles without finding patterns. Training cannot complete.")
+							print("❌ ERROR: Processed all number_of_candles without finding patterns. Training cannot complete.")
 							mark_training_error("Pattern finding exhausted")
 							sys.exit(1)
 					perfect_yes = 'no'
@@ -1823,6 +1827,32 @@ while True:
 								else:
 									# Price stayed within normal range - not tracked for bounce accuracy
 									pass
+								
+								# SIGNAL ACCURACY: Tracks directional accuracy for trade-signal predictions
+								# Only tracks when price approached predicted limits (would trigger a trade)
+								# BUY signal (high limit) → price went up = SUCCESS
+								# SELL signal (low limit) → price went down = SUCCESS
+								try:
+									# High limit approached = BUY signal (predicted strong UP move)
+									if high_percent_difference_of_actuals >= high_baseline_price_change_pct + tolerance:
+										# Check if price actually closed higher (went up as predicted)
+										if percent_difference_of_actuals > 0:
+											upordown_signal.append(1)  # Correct: BUY signal, price went up
+										else:
+											upordown_signal.append(0)  # Wrong: BUY signal, but price went down/flat
+									
+									# Low limit approached = SELL signal (predicted strong DOWN move)
+									elif low_percent_difference_of_actuals <= low_baseline_price_change_pct - tolerance:
+										# Check if price actually closed lower (went down as predicted)
+										if percent_difference_of_actuals < 0:
+											upordown_signal.append(1)  # Correct: SELL signal, price went down
+										else:
+											upordown_signal.append(0)  # Wrong: SELL signal, but price went up/flat
+									
+									# If no limit approached, don't track (not a trade signal)
+								except NameError:
+									# baseline_price_change_pct not yet defined (first iteration) - skip signal tracking
+									pass
 							else:
 								pass
 							# Calculate and display bounce accuracy if we have data
@@ -1831,8 +1861,16 @@ while True:
 								
 								# Store accuracy in dict for this timeframe
 								bounce_accuracy_dict[tf_choice] = accuracy
+							
+							# Calculate and store signal accuracy if we have data
+							if len(upordown_signal) > 0:
+								signal_accuracy = (sum(upordown_signal)/len(upordown_signal))*100
 								
-								# Print approximately every 1% of candles to reduce console I/O overhead
+								# Store signal accuracy in dict for this timeframe
+								signal_accuracy_dict[tf_choice] = signal_accuracy
+							
+							# Print approximately every 1% of candles to reduce console I/O overhead (for bounce accuracy)
+							if len(upordown4) > 0:
 								total_candles = len(price_list)
 								current_candle = len(price_list2)
 								print_interval = max(1, total_candles // 100)  # 1% intervals, minimum 1
@@ -1854,7 +1892,7 @@ while True:
 									
 									# Determine trend arrow by comparing to last PRINTED accuracy (not last candle)
 									if last_printed_accuracy is None:
-										trend_arrow = "[o]"  # First print, starting point
+										trend_arrow = "[~]"  # First print, starting point
 									elif accuracy > last_printed_accuracy + adaptive_threshold:
 										trend_arrow = "[+]"
 									elif accuracy < last_printed_accuracy - adaptive_threshold:
@@ -1870,7 +1908,29 @@ while True:
 									acceptance_formatted = format(api_acceptance_rate, '.1f').rstrip('0').rstrip('.')
 									print(f'Total Candles: {total_candles:,} ({acceptance_formatted}% acceptance)')
 									print(f'Candles Processed: {current_candle:,} ({threshold_formatted}% threshold, {volatility_formatted}% volatility)')
-									print(f'Bounce Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} breakout candles)')
+									print(f'Limit-Breach Accuracy: {trend_arrow} {formatted}% ({limit_test_count_formatted} predictions)')
+									
+									# Print signal accuracy if we have data
+									if len(upordown_signal) > 0:
+										sig_accuracy = (sum(upordown_signal)/len(upordown_signal))*100
+										sig_formatted = format(sig_accuracy, '.2f').rstrip('0').rstrip('.')
+										sig_count = len(upordown_signal)
+										sig_count_formatted = f'{sig_count:,}'
+										
+										# Calculate trend arrow for signal accuracy (same logic as bounce accuracy)
+										if last_printed_signal_accuracy is None:
+											sig_trend_arrow = "[o]"  # First print, starting point
+										elif sig_accuracy > last_printed_signal_accuracy + adaptive_threshold:
+											sig_trend_arrow = "[+]"
+										elif sig_accuracy < last_printed_signal_accuracy - adaptive_threshold:
+											sig_trend_arrow = "[-]"
+										else:
+											sig_trend_arrow = "[=]"  # No significant change
+										
+										print(f'Signal Accuracy: {sig_trend_arrow} {sig_formatted}% ({sig_count_formatted} signals triggered)')
+										
+										# Update last printed signal accuracy for next comparison
+										last_printed_signal_accuracy = sig_accuracy
 
 									# Update last printed accuracy for next comparison
 									last_printed_accuracy = accuracy
@@ -2067,7 +2127,7 @@ while True:
 										_memory_cache.clear()
 										the_big_index += 1
 										debug_print(f'Incremented the_big_index to {the_big_index} (next timeframe will be: {tf_choices[the_big_index] if the_big_index < len(tf_choices) else "DONE"})')
-										print('Moving to next timeframe')
+										print('\nMoving to next timeframe')
 										debug_print(f'Completed timeframe {tf_choice} - processed {len(price_list2)}/{len(price_list)} candles')
 										
 										# Check if we should continue to next timeframe or proceed to exit
@@ -2103,13 +2163,33 @@ while True:
 															if tf in bounce_accuracy_dict:
 																f.write(f'{tf}: {bounce_accuracy_dict[tf]:.2f}%\n')
 													
-													# Print summary
-													print()  # Empty line before bounce accuracy
-													print(f'Limit-Breach Accuracy Results ({_arg_coin})')
+													# Print combined summary
+													print()  # Empty line before accuracy summary
+													print(f'=== Training Accuracy Results ({_arg_coin}) ===')
 													print(f'Last trained: {timestamp}')
-													print(f'Average accuracy: {avg_accuracy:.2f}%')
-													tf_results = ', '.join([f'{tf}={bounce_accuracy_dict[tf]:.2f}%' for tf in tf_choices if tf in bounce_accuracy_dict])
-													print(f'Per timeframe: {tf_results}')
+													print()
+													
+													# Get signal accuracy average if available
+													avg_signal = 0.0
+													if signal_accuracy_dict:
+														avg_signal = sum(signal_accuracy_dict.values()) / len(signal_accuracy_dict)
+													
+													# Print averages
+													print(f'Average Limit-Breach Accuracy: {avg_accuracy:.2f}%')
+													if signal_accuracy_dict:
+														print(f'Average Signal Accuracy:       {avg_signal:.2f}%')
+													print()
+													
+													# Print per-timeframe results
+													print('Per Timeframe:')
+													for tf in tf_choices:
+														if tf in bounce_accuracy_dict:
+															limit_acc = bounce_accuracy_dict[tf]
+															sig_acc = signal_accuracy_dict.get(tf, 0.0) if signal_accuracy_dict else 0.0
+															if signal_accuracy_dict and tf in signal_accuracy_dict:
+																print(f'  {tf:8} | Limit: {limit_acc:5.2f}% | Signal: {sig_acc:5.2f}%')
+															else:
+																print(f'  {tf:8} | Limit: {limit_acc:5.2f}%')
 													
 													# Check for suspicious accuracy (99-100% often indicates incomplete training)
 													suspicious_accuracy = False
@@ -2123,7 +2203,24 @@ while True:
 														print(f'⚠ WARNING: Accuracy of 100% detected. This may indicate incomplete training.')
 														print(f'⚠ Please verify that training completed properly and memories were saved.')
 											except Exception as e:
-												print(f'Warning: Could not save bounce accuracy: {e}')
+												print(f'⚠ Warning: Could not save bounce accuracy: {e}')
+											
+											# Save signal accuracy to file
+											try:
+												if signal_accuracy_dict:
+													# Calculate average
+													avg_signal = sum(signal_accuracy_dict.values()) / len(signal_accuracy_dict)
+													
+													# Save to file
+													timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+													with open('signal_accuracy.txt', 'w', encoding='utf-8') as f:
+														f.write(f'Last Updated: {timestamp}\n')
+														f.write(f'Average: {avg_signal:.2f}%\n')
+														for tf in tf_choices:
+															if tf in signal_accuracy_dict:
+																f.write(f'{tf}: {signal_accuracy_dict[tf]:.2f}%\n')
+											except Exception as e:
+												print(f'⚠ Warning: Could not save signal accuracy: {e}')
 											
 											# Check if memory files are empty (indicates training failure)
 											training_valid = True

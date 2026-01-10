@@ -197,14 +197,14 @@ def robinhood_current_ask(symbol: str) -> float:
                 with open(key_path, "rb") as f:
                     api_key = _decrypt_with_dpapi(f.read())
         except Exception as e:
-            print(f"[Thinker] Warning: Failed to read encrypted API key: {e}")
+            print(f"⚠ [Thinker] Warning: Failed to read encrypted API key: {e}")
         
         try:
             if os.path.isfile(secret_path):
                 with open(secret_path, "rb") as f:
                     priv_b64 = _decrypt_with_dpapi(f.read())
         except Exception as e:
-            print(f"[Thinker] Warning: Failed to read encrypted private key: {e}")
+            print(f"⚠ [Thinker] Warning: Failed to read encrypted private key: {e}")
 
         if not api_key or not priv_b64:
             raise RuntimeError(
@@ -331,9 +331,8 @@ def handle_network_error(operation: str, error: Exception):
 		error: The exception that triggered the failure
 	"""
 	print(f"\n{'='*60}")
-	print(f"NETWORK ERROR: {operation} failed")
+	print(f"❌ NETWORK ERROR: {operation} failed")
 	print(f"Error: {type(error).__name__}: {str(error)[:200]}")
-	print(f"")
 	print(f"The process will exit. Please check:")
 	print(f"  1. Your internet connection")
 	print(f"  2. API service status (KuCoin/Robinhood)")
@@ -542,6 +541,13 @@ REQUIRED_THINKER_TIMEFRAMES = [
 distance = 0.5
 tf_choices = REQUIRED_THINKER_TIMEFRAMES
 
+# Load pattern_size from training_settings.json
+training_settings_path = os.path.join(os.path.dirname(__file__), "training_settings.json")
+with open(training_settings_path, 'r') as f:
+	training_settings = json.load(f)
+	PATTERN_SIZE = training_settings["pattern_size"]
+	print(f"[THINKER] Loaded pattern_size={PATTERN_SIZE} from training_settings.json")
+
 def new_coin_state():
 	"""Create initial state dictionary for a newly tracked coin.
 	
@@ -586,15 +592,15 @@ def new_coin_state():
 
 states = {}
 
-display_cache = {sym: f"{sym}  (starting.)" for sym in CURRENT_COINS}
+display_cache = {sym: f"[{sym}] Starting...\n[{sym}] Initializing predictions for all timeframes" for sym in CURRENT_COINS}
 
 def _validate_coin_training(coin: str) -> tuple:
 	"""Validate that a coin has all required timeframe data files present and non-empty.
 	
-	Checks for existence of memories, weights, and threshold files for each required timeframe.
-	All three files must exist and be at least 10 bytes (non-empty) for the timeframe to be
-	considered trained. This validation runs before the Thinker attempts to load predictions,
-	preventing crashes from missing or corrupted training data.
+	Checks for existence of memories, weights (base, high, low), and threshold files for each
+	required timeframe. All five files must exist and be at least 10 bytes (non-empty) for the
+	timeframe to be considered trained. This validation runs before the Thinker attempts to load
+	predictions, preventing crashes from missing or corrupted training data.
 	
 	Called by both the Thinker (to check training freshness) and the Hub (to show training
 	status in the GUI). Missing files indicate the Trainer hasn't run or training was interrupted.
@@ -615,10 +621,12 @@ def _validate_coin_training(coin: str) -> tuple:
 	for tf in REQUIRED_THINKER_TIMEFRAMES:
 		memory_file = os.path.join(folder, f"memories_{tf}.dat")
 		weight_file = os.path.join(folder, f"memory_weights_{tf}.dat")
+		weight_high_file = os.path.join(folder, f"memory_weights_high_{tf}.dat")
+		weight_low_file = os.path.join(folder, f"memory_weights_low_{tf}.dat")
 		threshold_file = os.path.join(folder, f"neural_perfect_threshold_{tf}.dat")
 		
-		# Check if all three files exist and are non-empty
-		for fpath in [memory_file, weight_file, threshold_file]:
+		# Check if all required files exist and are non-empty
+		for fpath in [memory_file, weight_file, weight_high_file, weight_low_file, threshold_file]:
 			if not os.path.isfile(fpath):
 				if tf not in missing:
 					missing.append(tf)
@@ -725,7 +733,7 @@ def _sync_coins_from_settings():
 		except Exception:
 			pass  # Best-effort; folder may already exist
 		try:
-			display_cache[sym] = f"{sym}  (starting.)"
+			display_cache[sym] = f"[{sym}] Starting...\n[{sym}] Initializing predictions for all timeframes"
 		except Exception:
 			pass  # Best-effort UI update; non-critical
 		try:
@@ -897,7 +905,11 @@ def step_coin(sym: str):
 			except Exception:
 				pass
 		try:
-			display_cache[sym] = sym + "  (NOT TRAINED / OUTDATED - run trainer)"
+			display_cache[sym] = (
+				f"[{sym}] NOT TRAINED / OUTDATED\n"
+				f"[{sym}] WARNING: Training data is missing or stale (>14 days old)\n"
+				f"[{sym}] Please run the trainer before starting predictions"
+			)
 		except Exception:
 			pass
 		try:
@@ -961,8 +973,8 @@ def step_coin(sym: str):
 		elif len(training_issues) > len(tf_choices):
 			del training_issues[len(tf_choices):]
 
-		# ====== ORIGINAL: fetch current candle for this timeframe index ======
-		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]}...")
+		# ====== Fetch current pattern (multiple candles for pattern matching) ======
+		debug_print(f"[DEBUG] {sym}: Fetching market data for timeframe {tf_choices[tf_choice_index]} (pattern_size={PATTERN_SIZE})...")
 		kucoin_api_retry_count = 0
 		kucoin_empty_data_count = 0
 		kucoin_max_retries = 5
@@ -985,34 +997,37 @@ def step_coin(sym: str):
 					continue
 			history_list = history.split("], [")
 			# KuCoin can occasionally return an empty/short kline response.
-			# Guard against history_list[1] raising IndexError.
-			if len(history_list) < 2:
+			# Need at least PATTERN_SIZE candles for pattern matching
+			if len(history_list) < PATTERN_SIZE:
 				kucoin_empty_data_count += 1
 				if kucoin_empty_data_count >= kucoin_max_retries:
-					debug_print(f"[DEBUG] {sym}: KuCoin returned empty data after {kucoin_max_retries} attempts")
+					debug_print(f"[DEBUG] {sym}: KuCoin returned insufficient data after {kucoin_max_retries} attempts (need {PATTERN_SIZE} candles)")
 					# Skip this cycle rather than crashing
 					st['tf_choice_index'] = tf_choice_index
 					states[sym] = st
 					return
 				time.sleep(_get_sleep_timing("sleep_data_validation_retry"))
 				continue
-			working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
+			
+			# Fetch last PATTERN_SIZE candles and convert to percentage changes
+			# For pattern_size=5, we need 4 prior candles (indices 1-4) to create the pattern
+			# The trainer creates patterns with (pattern_size - 1) values
+			current_pattern = []
 			try:
-				openPrice = float(working_minute[1])
-				closePrice = float(working_minute[2])
+				for i in range(1, PATTERN_SIZE):
+					working_candle = str(history_list[i]).replace('"', '').replace("'", "").split(", ")
+					openPrice = float(working_candle[1])
+					closePrice = float(working_candle[2])
+					if openPrice == 0:
+						raise ValueError(f"Zero openPrice at candle index {i}")
+					candle_pct = 100 * ((closePrice - openPrice) / openPrice)
+					current_pattern.append(candle_pct)
 				break
-			except Exception:
+			except Exception as e:
+				debug_print(f"[DEBUG] {sym}: Failed to parse candle data: {e}")
 				continue
 
-		# Prevent division by zero if openPrice is 0.0 (corrupt/stale data)
-		if openPrice == 0:
-			debug_print(f"[DEBUG] {sym}: openPrice is zero, skipping this cycle")
-			st['tf_choice_index'] = tf_choice_index
-			states[sym] = st
-			return
-		
-		current_candle = 100 * ((closePrice - openPrice) / openPrice)
-		debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current candle: {current_candle:.4f}%")
+		debug_print(f"[DEBUG] {sym}: Market data fetched successfully. Current pattern (last {PATTERN_SIZE-1} candles): {[f'{v:.4f}%' for v in current_pattern]}")
 
 		# ====== ORIGINAL: load threshold + memories/weights and compute moves ======
 		debug_print(f"[DEBUG] {sym}: Loading neural training files...")
@@ -1077,6 +1092,12 @@ def step_coin(sym: str):
 			low_unweighted = []
 			high_moves = []
 			low_moves = []
+			
+			# Track pattern matching statistics for diagnostics
+			patterns_checked = 0
+			patterns_skipped = 0
+			patterns_matched = 0
+			closest_diff = float('inf')
 
 			debug_print(f"[DEBUG] {sym}: Processing {len(memory_list)} memory patterns...")
 			while mem_ind < len(memory_list):
@@ -1085,6 +1106,7 @@ def step_coin(sym: str):
 				if len(parts) < 3:
 					# Corrupted/incomplete training data - skip this pattern
 					debug_print(f"[DEBUG] {sym}: Skipping corrupted memory pattern at index {mem_ind} (insufficient parts: {len(parts)})")
+					patterns_skipped += 1
 					mem_ind += 1
 					continue
 				
@@ -1092,43 +1114,75 @@ def step_coin(sym: str):
 					memory_pattern = _clean_training_string(parts[0]).split('|')
 					if not memory_pattern:
 						# Empty pattern after cleaning - skip
+						patterns_skipped += 1
 						mem_ind += 1
 						continue
 				except Exception:
 					debug_print(f"[DEBUG] {sym}: Failed to parse memory pattern at index {mem_ind}")
+					patterns_skipped += 1
 					mem_ind += 1
 					continue
 				
-				check_dex = 0
-				memory_candle = float(memory_pattern[check_dex])
-
-				# Calculate percentage difference with proper zero-denominator protection
-				average = (current_candle + memory_candle) / 2
-				if abs(average) < 1e-10:  # Essentially zero (handles +5 and -5 summing to 0)
-					difference = 0.0
-				else:
+				# For multi-candle patterns, compare ALL candles in the pattern
+				# memory_pattern contains (PATTERN_SIZE - 1) values, same as current_pattern
+				pattern_length = PATTERN_SIZE - 1
+				
+				# Validate memory pattern has correct length
+				if len(memory_pattern) < pattern_length:
+					debug_print(f"[DEBUG] {sym}: Memory pattern too short ({len(memory_pattern)} < {pattern_length}) at index {mem_ind}")
+					patterns_skipped += 1
+					mem_ind += 1
+					continue
+				
+				# Calculate average difference across all candles in the pattern
+				total_diff = 0.0
+				valid_comparisons = 0
+				for i in range(pattern_length):
 					try:
-						difference = abs((abs(current_candle - memory_candle) / average) * 100)
+						current_val = current_pattern[i]
+						memory_val = float(memory_pattern[i])
+						average = (current_val + memory_val) / 2
+						if abs(average) < 1e-10:  # Essentially zero
+							diff = 0.0
+						else:
+							diff = abs((abs(current_val - memory_val) / average) * 100)
+						total_diff += diff
+						valid_comparisons += 1
 					except Exception:
-						difference = 0.0
+						continue
+				
+				if valid_comparisons == 0:
+					patterns_skipped += 1
+					mem_ind += 1
+					continue
+				
+				diff_avg = total_diff / valid_comparisons
+				patterns_checked += 1
+				
+				# Track closest match for diagnostics
+				if diff_avg < closest_diff:
+					closest_diff = diff_avg
 
-				diff_avg = difference
+				# Parse high_diff and low_diff for all patterns (needed for later use)
+				# Use pre-validated parts from split (already verified len >= 3)
+				try:
+					high_diff = float(_clean_training_string(parts[1])) / 100
+					low_diff = float(_clean_training_string(parts[2])) / 100
+				except (ValueError, IndexError) as e:
+					# Failed to parse high/low diffs - skip this pattern
+					debug_print(f"[DEBUG] {sym}: Failed to parse high/low diffs at index {mem_ind}: {e}")
+					patterns_skipped += 1
+					mem_ind += 1
+					continue
 
 				if diff_avg <= perfect_threshold:
 					any_perfect = 'yes'
-					# Use pre-validated parts from split (already verified len >= 3)
-					try:
-						high_diff = float(_clean_training_string(parts[1])) / 100
-						low_diff = float(_clean_training_string(parts[2])) / 100
-					except (ValueError, IndexError) as e:
-						# Failed to parse high/low diffs - skip this pattern
-						debug_print(f"[DEBUG] {sym}: Failed to parse high/low diffs at index {mem_ind}: {e}")
-						mem_ind += 1
-						continue
+					patterns_matched += 1
 
 				# Validate weight list indices before accessing
 				if mem_ind >= len(weight_list) or mem_ind >= len(high_weight_list) or mem_ind >= len(low_weight_list):
 					debug_print(f"[DEBUG] {sym}: Weight list length mismatch at index {mem_ind} (memory: {len(memory_list)}, weight: {len(weight_list)}, high: {len(high_weight_list)}, low: {len(low_weight_list)}) - skipping pattern")
+					patterns_skipped += 1
 					mem_ind += 1
 					continue
 
@@ -1155,12 +1209,14 @@ def step_coin(sym: str):
 				# Check if we've processed all memory patterns
 				if mem_ind >= len(memory_list):
 					if any_perfect == 'no':
+						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: No patterns matched threshold {perfect_threshold:.2f}%. Current pattern: {[f'{v:.2f}%' for v in current_pattern]}, Checked: {patterns_checked}, Skipped: {patterns_skipped}, Closest: {closest_diff:.2f}%")
 						final_moves = 0.0
 						high_final_moves = 0.0
 						low_final_moves = 0.0
 						perfects[tf_choice_index] = 'inactive'
 					elif moves and high_moves and low_moves:
 						# Only calculate averages if lists are non-empty
+						debug_print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]}: Matched {patterns_matched} patterns. Checked: {patterns_checked}, Skipped: {patterns_skipped}")
 						final_moves = sum(moves) / len(moves)
 						high_final_moves = sum(high_moves) / len(high_moves)
 						low_final_moves = sum(low_moves) / len(low_moves)
@@ -1184,20 +1240,23 @@ def step_coin(sym: str):
 		with open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.dat', 'w+') as file:
 			file.write(str(perfect_threshold))
 
-		# ====== ORIGINAL: compute new high/low predictions ======
-		price_list2 = [openPrice, closePrice]
-		current_pattern = [price_list2[0], price_list2[1]]
-
+		# ====== Compute new high/low predictions ======
+		# For price predictions, we need the most recent (last) candle's close price
+		last_candle_data = str(history_list[PATTERN_SIZE-1]).replace('"', '').replace("'", "").split(", ")
+		last_open = float(last_candle_data[1])
+		last_close = float(last_candle_data[2])
+		
 		try:
 			c_diff = final_moves / 100
 			high_diff = high_final_moves
 			low_diff = low_final_moves
 
-			start_price = current_pattern[len(current_pattern) - 1]
+			# Use the close price of the most recent candle as the starting point
+			start_price = last_close
 			high_new_price = start_price + (start_price * high_diff)
 			low_new_price = start_price + (start_price * low_diff)
 		except Exception:
-			start_price = current_pattern[len(current_pattern) - 1]
+			start_price = last_close
 			high_new_price = start_price
 			low_new_price = start_price
 
@@ -1470,10 +1529,76 @@ def step_coin(sym: str):
 
 			# cache display text for this coin (main loop prints everything on one screen)
 			try:
-				display_cache[sym] = (
-					sym + '  ' + str(current) + '\n' +
-					str(messages).replace("', '", "\n")
-				)
+				# Count signal consensus
+				actives = perfects.count('active')
+				inactives = perfects.count('inactive')
+				withins = sum(1 for msg in messages if 'WITHIN' in msg)
+				longs_count = tf_sides.count('long')
+				shorts_count = tf_sides.count('short')
+				
+				# Determine overall signal
+				if longs_count >= 3:
+					signal_status = "LONG"
+					signal_indicator = "[v]"
+				elif shorts_count >= 3:
+					signal_status = "SHORT"
+					signal_indicator = "[^]"
+				elif withins > 0:
+					signal_status = "WITHIN"
+					signal_indicator = "[=]"
+				else:
+					signal_status = "INACTIVE"
+					signal_indicator = "[o]"
+				
+				# Format current price with proper decimals
+				price_str = f"${current:,.2f}" if current < 1000 else f"${current:,.0f}"
+				
+				# Build output lines
+				lines = []
+				lines.append(f"[{sym}] Current Price: {price_str}")
+				lines.append(f"[{sym}] Signal: {signal_indicator} {signal_status} (Long:{longs_count} Short:{shorts_count} Within:{withins})")
+				lines.append(f"[{sym}] Pattern Matching: {actives}/7 active, {inactives}/7 inactive")
+				
+				# Build timeframe rows
+				for i, tf in enumerate(tf_choices):
+					# Get status
+					if 'LONG' in messages[i]:
+						status = "LONG"
+					elif 'SHORT' in messages[i]:
+						status = "SHORT"
+					elif 'WITHIN' in messages[i]:
+						status = "WITHIN"
+					elif 'INACTIVE' in messages[i]:
+						status = "INACTIVE"
+					else:
+						status = "Starting"
+					
+					# Calculate distance to boundaries as percentage
+					low_bound = low_bound_prices[i]
+					high_bound = high_bound_prices[i]
+					
+					if low_bound != 0.0 and high_bound != float('inf'):
+						low_dist = ((current - low_bound) / current) * 100
+						high_dist = ((high_bound - current) / current) * 100
+						bounds_text = f"Low:{low_dist:+.1f}% High:{high_dist:+.1f}%"
+					elif low_bound != 0.0:
+						low_dist = ((current - low_bound) / current) * 100
+						bounds_text = f"Low:{low_dist:+.1f}% High:--"
+					elif high_bound != float('inf'):
+						high_dist = ((high_bound - current) / current) * 100
+						bounds_text = f"Low:-- High:{high_dist:+.1f}%"
+					else:
+						bounds_text = "No boundaries"
+					
+					lines.append(f"[{sym}]   {tf:>6s}: {status:8s} {bounds_text}")
+				
+				# Add DCA signal info
+				active_margins = [m for m in margins if m != 0]
+				pm_value = sum(active_margins) / len(active_margins) if len(active_margins) > 0 else 0.25
+				lines.append(f"[{sym}] DCA Signals: Long={longs_count} Short={shorts_count} | Profit Margin: {pm_value:.2%}")
+				
+				# Combine all parts
+				display_cache[sym] = '\n'.join(lines)
 
 				# The GUI-visible messages were generated using the bounds_version that was in state at the
 				# start of this full-sweep (before we rebuilt bounds above).
@@ -1603,6 +1728,10 @@ def step_coin(sym: str):
 
 		states[sym] = st
 
+# Track first iteration for startup message
+_first_run = True
+_startup_message_shown = False
+
 try:
 	while True:
 		# Hot-reload coins from GUI settings while running
@@ -1617,6 +1746,12 @@ try:
 		# clear + re-print one combined screen (so you don't see old output above new)
 		os.system('cls' if os.name == 'nt' else 'clear')
 
+		# Print header with system status
+		from datetime import datetime
+		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		ready_count = len(_ready_coins)
+		total_count = len(coins_this_iteration)
+
 		# Validate training status and display persistent warning if incomplete
 		training_warnings = []
 		for _sym in coins_this_iteration:
@@ -1625,25 +1760,26 @@ try:
 				training_warnings.append(f"{_sym}: Missing {', '.join(missing_tfs)}")
 
 		if training_warnings:
-			print("="*70)
-			print("⚠ WARNING: INCOMPLETE TRAINING DETECTED ⚠")
-			print("="*70)
-			print("The following coins are missing required timeframe training:")
-			print()
+			print("⚠ WARNING: INCOMPLETE TRAINING DETECTED")
 			for warning in training_warnings:
-				print(f"  • {warning}")
+				print(f"  {warning}")
+			print(f"Required timeframes: {', '.join(REQUIRED_THINKER_TIMEFRAMES)}")
+			print("Predictions may be inaccurate until training is complete.")
 			print()
-			print("Required timeframes:", ", ".join(REQUIRED_THINKER_TIMEFRAMES))
-			print()
-			print("Predictions may be inaccurate or use placeholder values.")
-			print("Please complete training for all coins before trading.")
-			print("="*70)
-			print()
+			_startup_message_shown = False  # Reset if warnings appear
+		else:
+			# Show startup message only on first successful validation
+			if _first_run and not _startup_message_shown:
+				print(f"✓ All training data validated | {ready_count}/{total_count} coins ready")
+				print("Ready to engage autopilot")
+				print()
+				_startup_message_shown = True
+
+		_first_run = False
 
 		# Print all coins' display output (use cached display from step_coin which includes symbol header)
 		for _sym in coins_this_iteration:
-			print()  # Add spacing before each coin section
-			output = display_cache.get(_sym, _sym + "  (no data yet)")
+			output = display_cache.get(_sym, f"[{_sym}] No data yet")
 			# Strip BOM, zero-width spaces, and other invisible Unicode
 			output = output.replace('\ufeff', '').replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')
 			# Convert to ASCII only
@@ -1651,6 +1787,7 @@ try:
 			# Remove any remaining control characters except newline and tab
 			output = ''.join(ch for ch in output if ch.isprintable() or ch in '\n\t')
 			print(output)
+			print()  # Add spacing after each coin section
 		
 		# small sleep so you don't peg CPU when running many coins
 		time.sleep(_get_sleep_timing("sleep_main_loop"))
