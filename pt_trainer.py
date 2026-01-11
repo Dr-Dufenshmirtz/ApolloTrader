@@ -1920,7 +1920,7 @@ while True:
 										
 										# Calculate trend arrow for signal accuracy (same logic as bounce accuracy)
 										if last_printed_signal_accuracy is None:
-											sig_trend_arrow = "[o]"  # First print, starting point
+											sig_trend_arrow = "[~]"  # First print, starting point
 										elif sig_accuracy > last_printed_signal_accuracy + adaptive_threshold:
 											sig_trend_arrow = "[+]"
 										elif sig_accuracy < last_printed_signal_accuracy - adaptive_threshold:
