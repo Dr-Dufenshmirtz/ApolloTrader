@@ -3964,30 +3964,42 @@ class ApolloHub(tk.Tk):
         # Check training status
         status_map = self._training_status_map()
         needs_training = [c for c, s in status_map.items() if s in ("NOT TRAINED", "ERROR", "STOPPED")]
+        currently_training = [c for c, s in status_map.items() if s == "TRAINING"]
         
         # Check staleness (always respect staleness_days from training_settings.json)
         stale_coins = self._get_stale_coins()
         
         all_needs_training = list(set(needs_training + stale_coins))
         
-        if all_needs_training:
-            # Phase 1: Training required
+        if all_needs_training or currently_training:
+            # Phase 1: Training required or already in progress
             self._auto_mode_active = True
             self._auto_mode_phase = "TRAINING"
-            self._auto_mode_pending_coins = set(all_needs_training)
+            self._auto_mode_pending_coins = set(all_needs_training + currently_training)
             
             # Show info about what's being trained
-            messagebox.showinfo(
-                "🚀 Autopilot: Training Required",
-                f"Training is needed for: {', '.join(sorted(all_needs_training))}\n\n"
-                f"Autopilot will train these coins first, then start thinker and trader.\n\n"
-                f"This may take several minutes."
-            )
-            
-            # Start trainers for coins that need it
-            for coin in all_needs_training:
-                self.trainer_coin_var.set(coin)
-                self.start_trainer_for_selected_coin()
+            if currently_training and not all_needs_training:
+                # Training already in progress, just wait for completion
+                messagebox.showinfo(
+                    "🚀 Autopilot: Training In Progress",
+                    f"Training is already underway for: {', '.join(sorted(currently_training))}\n\n"
+                    f"Autopilot will wait for training to complete, then start thinker and trader.\n\n"
+                    f"This may take several hours."
+                )
+            else:
+                # Need to start new training
+                messagebox.showinfo(
+                    "🚀 Autopilot: Training Required",
+                    f"Training is needed for: {', '.join(sorted(all_needs_training))}\n\n"
+                    f"Autopilot will train these coins first, then start thinker and trader.\n\n"
+                    f"This may take several hours."
+                )
+                
+                # Start trainers for coins that need it (don't restart already-training coins)
+                for coin in all_needs_training:
+                    if coin not in currently_training:
+                        self.trainer_coin_var.set(coin)
+                        self.start_trainer_for_selected_coin()
             
             # Poll for training completion
             self.after(2000, self._poll_auto_mode_training)
@@ -5334,7 +5346,7 @@ class ApolloHub(tk.Tk):
                     "Please train at least one coin before starting the Thinker:\n\n"
                     "  1. Select a coin (BTC, ETH, etc.)\n"
                     "  2. Click 'Train' or 'Train All'\n"
-                    "  3. Wait for training to complete (may take 10-30 minutes)\n"
+                    "  3. Wait for training to complete (may take 1-8 hours)\n"
                     "  4. Once training finishes, the Thinker can be started\n\n"
                     "Training creates AI memory patterns that predict price movements.\n"
                 )
@@ -5448,14 +5460,14 @@ class ApolloHub(tk.Tk):
                             f"Training data is stale for: {stale_list}\n\n"
                             f"Batch retraining all coins within 24hrs of staleness: {batch_list}\n\n"
                             f"System will restart automatically when complete.\n\n"
-                            f"Estimated time: 5-15 minutes per coin."
+                            f"Estimated time: 1-12 hours per coin."
                         )
                     else:
                         messagebox.showinfo(
                             "Auto-Retrain Starting",
                             f"Training data is stale for: {stale_list}\n\n"
                             f"System will auto-retrain and restart when complete.\n\n"
-                            f"Estimated time: 5-15 minutes per coin."
+                            f"Estimated time: 1-12 hours per coin."
                         )
                     
                     # Start training for all coins that need it
